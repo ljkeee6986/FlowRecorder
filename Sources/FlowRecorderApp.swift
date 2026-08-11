@@ -248,6 +248,16 @@ final class AppModel: ObservableObject {
         return "区域 \(Int(selectedCaptureRect.width))×\(Int(selectedCaptureRect.height))"
     }
 
+    var captureModeHelp: String {
+        if selectedWindowID != nil {
+            return "只录选中的窗口，窗口移动或内容变化都会跟着录。"
+        }
+        if selectedCaptureRect != nil {
+            return "只录固定区域，适合短视频画幅或局部演示。"
+        }
+        return "录制主屏幕全屏，最稳妥。"
+    }
+
     var selectedWindowDescription: String {
         guard let selectedWindowID,
               let option = windowOptions.first(where: { $0.id == selectedWindowID }) else {
@@ -374,7 +384,7 @@ final class AppModel: ObservableObject {
         guard !isRecording, !isBusy else { return }
         selectedWindowID = option.id
         selectedCaptureRect = nil
-        status = "已选择窗口录制：\(option.displayName)。窗口内容会跟随该窗口变化。"
+        status = "已选择窗口录制：\(option.displayName)。窗口移动后请重新选择一次。"
     }
 
     func reveal(_ item: RecordingItem) {
@@ -603,6 +613,8 @@ struct MainView: View {
     @ObservedObject var model: AppModel
     @State private var cameraShown = false
     @State private var teleprompterShown = false
+    @State private var windowPickerShown = false
+    @State private var windowSearchText = ""
 
     private let panelRadius: CGFloat = 18
     private let freshBlue = Color(red: 0.16, green: 0.48, blue: 0.95)
@@ -645,6 +657,14 @@ struct MainView: View {
         }
         .onAppear {
             Task { await model.refreshWindowOptions() }
+        }
+        .sheet(isPresented: $windowPickerShown) {
+            WindowPickerSheet(
+                model: model,
+                searchText: $windowSearchText,
+                isPresented: $windowPickerShown
+            )
+            .frame(width: 720, height: 560)
         }
     }
 
@@ -853,6 +873,10 @@ struct MainView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                    Text(model.captureModeHelp)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary.opacity(0.86))
+                        .lineLimit(1)
                 }
                 Spacer()
                 Button("选择区域") {
@@ -885,25 +909,14 @@ struct MainView: View {
                 Text("窗口录制")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                Menu {
-                    Button("刷新窗口列表") {
-                        Task { await model.refreshWindowOptions() }
-                    }
-                    Divider()
-                    if model.windowOptions.isEmpty {
-                        Text("暂无可选窗口")
-                    } else {
-                        ForEach(model.windowOptions) { option in
-                            Button(option.displayName) {
-                                model.selectWindow(option)
-                            }
-                        }
-                    }
+                Button {
+                    windowPickerShown = true
+                    Task { await model.refreshWindowOptions() }
                 } label: {
                     Label(model.selectedWindowDescription, systemImage: "macwindow")
                         .lineLimit(1)
                 }
-                .menuStyle(.borderlessButton)
+                .buttonStyle(.bordered)
                 .disabled(model.isRecording || model.isBusy || model.isRefreshingWindows)
 
                 Button {
@@ -940,6 +953,8 @@ struct MainView: View {
         .padding(.vertical, 11)
         .padding(.horizontal, 4)
     }
+
+    private var windowPickerTint: Color { freshIndigo }
 
     private var teleprompterPanel: some View {
         freshPanel {
@@ -1070,6 +1085,169 @@ struct MainView: View {
         if teleprompterShown {
             OverlayManager.shared.updateTeleprompter(text: model.teleprompterText, fontSize: model.teleprompterFontSize, scrollSpeed: model.teleprompterScrollSpeed)
         }
+    }
+}
+
+struct WindowPickerSheet: View {
+    @ObservedObject var model: AppModel
+    @Binding var searchText: String
+    @Binding var isPresented: Bool
+
+    private let tint = Color(red: 0.44, green: 0.42, blue: 0.92)
+    private let ink = Color(red: 0.13, green: 0.17, blue: 0.23)
+
+    private var filteredOptions: [WindowCaptureOption] {
+        let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !keyword.isEmpty else { return model.windowOptions }
+        return model.windowOptions.filter {
+            $0.appName.lowercased().contains(keyword)
+            || $0.title.lowercased().contains(keyword)
+            || $0.displayName.lowercased().contains(keyword)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("选择要录制的窗口")
+                        .font(.system(size: 22, weight: .semibold, design: .rounded))
+                        .foregroundStyle(ink)
+                    Text("适合录 PPT、微信、浏览器、Codex。窗口移动后，重新选择一次更稳。")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    Task { await model.refreshWindowOptions() }
+                } label: {
+                    Label(model.isRefreshingWindows ? "刷新中" : "刷新", systemImage: model.isRefreshingWindows ? "hourglass" : "arrow.clockwise")
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isRefreshingWindows || model.isRecording || model.isBusy)
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.secondary.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("搜索 App 或窗口标题，比如 PPT、微信、Chrome、Codex", text: $searchText)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 13)
+            .padding(.vertical, 10)
+            .background(Color.white.opacity(0.86), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(tint.opacity(0.12), lineWidth: 1))
+
+            if filteredOptions.isEmpty {
+                emptyState
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 8) {
+                        ForEach(filteredOptions) { option in
+                            windowOptionRow(option)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
+            Divider().opacity(0.45)
+            HStack(spacing: 10) {
+                Label("提示：如果窗口没出现，先把目标窗口点到前台，再点刷新；如果移动窗口，录制前重新选择。", systemImage: "lightbulb")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("恢复全屏录制") {
+                    model.clearCaptureRegion()
+                    isPresented = false
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .padding(24)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.96, green: 0.99, blue: 1.00),
+                    Color(red: 0.97, green: 0.96, blue: 1.00)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "macwindow.badge.plus")
+                .font(.system(size: 40, weight: .semibold))
+                .foregroundStyle(tint.opacity(0.85))
+            Text(searchText.isEmpty ? "暂无可选窗口" : "没有匹配的窗口")
+                .font(.headline)
+            Text("打开或切到你要录制的 PPT、微信、浏览器、Codex 窗口后，再点刷新。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(32)
+    }
+
+    private func windowOptionRow(_ option: WindowCaptureOption) -> some View {
+        let isSelected = model.selectedWindowID == option.id
+        return Button {
+            model.selectWindow(option)
+            isPresented = false
+        } label: {
+            HStack(spacing: 13) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(isSelected ? tint.opacity(0.18) : Color.white.opacity(0.78))
+                    Image(systemName: "macwindow")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(tint)
+                }
+                .frame(width: 42, height: 42)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(option.appName)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(ink)
+                        Text("\(option.width)×\(option.height)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(option.shortName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                if isSelected {
+                    Label("当前", systemImage: "checkmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(tint)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary.opacity(0.65))
+                }
+            }
+            .padding(12)
+            .background(isSelected ? tint.opacity(0.10) : Color.white.opacity(0.68), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(isSelected ? tint.opacity(0.24) : tint.opacity(0.08), lineWidth: 1))
+        }
+        .buttonStyle(.plain)
     }
 }
 final class OverlayManager {
@@ -1881,11 +2059,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 throw RecorderError.windowNotFound
             }
 
-            let size = normalizedVideoSize(from: window.frame.size)
-            let filter = SCContentFilter(desktopIndependentWindow: window)
+            let sourceRect = normalizedSourceRect(window.frame, displayFrame: display.frame)
+            let size = normalizedVideoSize(from: sourceRect.size)
+            let filter = SCContentFilter(display: display, including: [window])
             return (
                 filter: filter,
-                sourceRect: nil,
+                sourceRect: sourceRect,
                 width: size.width,
                 height: size.height
             )
@@ -1923,8 +2102,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 
     private func validatePlayableMovie(at url: URL, expectedAudioTracks: Int) async throws {
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
-        guard let fileSize = values.fileSize, fileSize > 64_000 else {
-            throw RecorderError.saveFailed("文件过小，可能没有完整写入")
+        guard let fileSize = values.fileSize, fileSize > 1_024 else {
+            throw RecorderError.saveFailed("文件为空或过小，可能没有完整写入")
         }
 
         let asset = AVURLAsset(url: url)
