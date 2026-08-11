@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Build outputs
+build/
+*.app/
+*.dSYM/
+
+# Local signing certificates and private keys
+certs/
+*.key
+*.p12
+*.mobileprovision
+
+# Temporary and backup files
+*.bak
+*.bak-*
+*.tmp
+*.recording.mp4
+
+# Local logs / generated media
+*.log
+*.mp4
+*.mov
+
+# Xcode / SwiftPM local state, if added later
+.build/
+DerivedData/
+*.xcuserdata/
+xcuserdata/
+
