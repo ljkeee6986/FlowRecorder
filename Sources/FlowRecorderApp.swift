@@ -118,6 +118,9 @@ final class AppModel: ObservableObject {
     @Published var microphoneDevices: [MicrophoneDevice] = []
     @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID
     @Published var selectedCaptureRect: CGRect?
+    @Published var selectedWindowID: CGWindowID?
+    @Published var windowOptions: [WindowCaptureOption] = []
+    @Published var isRefreshingWindows = false
     @Published var teleprompterFontSize = 28.0
     @Published var teleprompterScrollSpeed = 0.0
     @Published var teleprompterText = """
@@ -172,11 +175,17 @@ final class AppModel: ObservableObject {
 
             status = "正在准备录制..."
             let microphoneDeviceID = includeMicrophone ? selectedMicrophoneDevice?.uniqueID : nil
+            let captureTarget: RecorderCaptureTarget = {
+                if let selectedWindowID {
+                    return .window(selectedWindowID)
+                }
+                return .display(rect: selectedCaptureRect)
+            }()
             let url = try await recorder.start(
                 includeSystemAudio: includeSystemAudio,
                 includeMicrophone: includeMicrophone,
                 microphoneDeviceID: microphoneDeviceID,
-                captureRect: selectedCaptureRect
+                captureTarget: captureTarget
             )
             outputURL = nil
             isRecording = true
@@ -231,8 +240,20 @@ final class AppModel: ObservableObject {
     }
 
     var captureAreaDescription: String {
+        if let selectedWindowID,
+           let option = windowOptions.first(where: { $0.id == selectedWindowID }) {
+            return "窗口：\(option.shortName)"
+        }
         guard let selectedCaptureRect else { return "全屏" }
         return "区域 \(Int(selectedCaptureRect.width))×\(Int(selectedCaptureRect.height))"
+    }
+
+    var selectedWindowDescription: String {
+        guard let selectedWindowID,
+              let option = windowOptions.first(where: { $0.id == selectedWindowID }) else {
+            return "未选择窗口"
+        }
+        return option.displayName
     }
 
     func refreshMicrophoneDevices() {
@@ -260,6 +281,7 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 if let rect, rect.width >= 80, rect.height >= 80 {
+                    self.selectedWindowID = nil
                     self.selectedCaptureRect = rect
                     self.status = "已选择录制区域：\(Int(rect.width))×\(Int(rect.height))。"
                 } else {
@@ -271,8 +293,88 @@ final class AppModel: ObservableObject {
 
     func clearCaptureRegion() {
         guard !isRecording, !isBusy else { return }
+        selectedWindowID = nil
         selectedCaptureRect = nil
         status = "录制范围已恢复为全屏。"
+    }
+
+    func applyCapturePreset(_ preset: CaptureAreaPreset) {
+        guard !isRecording, !isBusy else { return }
+        selectedWindowID = nil
+
+        guard let screenFrame = NSScreen.main?.frame else {
+            selectedCaptureRect = nil
+            status = "没有找到主屏幕，已恢复为全屏。"
+            return
+        }
+
+        switch preset {
+        case .fullScreen:
+            selectedCaptureRect = nil
+            status = "录制范围已恢复为全屏。"
+        case .landscape16x9, .vertical9x16, .square1x1:
+            selectedCaptureRect = preset.centeredRect(in: screenFrame)
+            if let selectedCaptureRect {
+                status = "已套用\(preset.label)：\(Int(selectedCaptureRect.width))×\(Int(selectedCaptureRect.height))。"
+            }
+        }
+    }
+
+    func refreshWindowOptions() async {
+        guard !isRecording, !isBusy else { return }
+        isRefreshingWindows = true
+        defer { isRefreshingWindows = false }
+
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            let ownPID = ProcessInfo.processInfo.processIdentifier
+            let options = content.windows.compactMap { window -> WindowCaptureOption? in
+                guard let app = window.owningApplication,
+                      app.processID != ownPID,
+                      window.frame.width >= 160,
+                      window.frame.height >= 100 else {
+                    return nil
+                }
+
+                let title = (window.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let safeTitle = title.isEmpty ? "未命名窗口" : title
+                return WindowCaptureOption(
+                    id: window.windowID,
+                    appName: app.applicationName,
+                    title: safeTitle,
+                    width: Int(window.frame.width),
+                    height: Int(window.frame.height)
+                )
+            }
+
+            var seen = Set<CGWindowID>()
+            windowOptions = options.filter { option in
+                if seen.contains(option.id) { return false }
+                seen.insert(option.id)
+                return true
+            }
+            .prefix(24)
+            .map { $0 }
+
+            if let selectedWindowID, !windowOptions.contains(where: { $0.id == selectedWindowID }) {
+                self.selectedWindowID = nil
+                selectedCaptureRect = nil
+                status = "原窗口已关闭，录制范围已恢复为全屏。"
+            } else if !windowOptions.isEmpty {
+                status = "已刷新窗口列表，可选择 PPT、微信、浏览器或 Codex 窗口录制。"
+            } else {
+                status = "没有找到可录制窗口，仍可使用全屏或区域录制。"
+            }
+        } catch {
+            status = "刷新窗口列表失败：\(humanReadable(error))"
+        }
+    }
+
+    func selectWindow(_ option: WindowCaptureOption) {
+        guard !isRecording, !isBusy else { return }
+        selectedWindowID = option.id
+        selectedCaptureRect = nil
+        status = "已选择窗口录制：\(option.displayName)。窗口内容会跟随该窗口变化。"
     }
 
     func reveal(_ item: RecordingItem) {
@@ -393,6 +495,86 @@ struct MicrophoneDevice: Identifiable, Hashable {
     let uniqueID: String?
 }
 
+enum CaptureAreaPreset: String, CaseIterable, Identifiable {
+    case fullScreen
+    case landscape16x9
+    case vertical9x16
+    case square1x1
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fullScreen:
+            return "全屏"
+        case .landscape16x9:
+            return "16:9 横屏"
+        case .vertical9x16:
+            return "9:16 竖屏"
+        case .square1x1:
+            return "1:1 方形"
+        }
+    }
+
+    var ratio: CGFloat? {
+        switch self {
+        case .fullScreen:
+            return nil
+        case .landscape16x9:
+            return 16.0 / 9.0
+        case .vertical9x16:
+            return 9.0 / 16.0
+        case .square1x1:
+            return 1.0
+        }
+    }
+
+    func centeredRect(in screenFrame: CGRect) -> CGRect? {
+        guard let ratio else { return nil }
+
+        let margin: CGFloat = 72
+        let maxWidth = max(160, screenFrame.width - margin * 2)
+        let maxHeight = max(100, screenFrame.height - margin * 2)
+
+        var width = maxWidth
+        var height = width / ratio
+        if height > maxHeight {
+            height = maxHeight
+            width = height * ratio
+        }
+
+        let evenWidth = CGFloat(max(80, Int(width) - Int(width) % 2))
+        let evenHeight = CGFloat(max(80, Int(height) - Int(height) % 2))
+        return CGRect(
+            x: screenFrame.midX - evenWidth / 2,
+            y: screenFrame.midY - evenHeight / 2,
+            width: evenWidth,
+            height: evenHeight
+        ).integral
+    }
+}
+
+struct WindowCaptureOption: Identifiable, Hashable {
+    let id: CGWindowID
+    let appName: String
+    let title: String
+    let width: Int
+    let height: Int
+
+    var shortName: String {
+        title == "未命名窗口" ? appName : title
+    }
+
+    var displayName: String {
+        "\(appName) · \(shortName) · \(width)×\(height)"
+    }
+}
+
+enum RecorderCaptureTarget {
+    case display(rect: CGRect?)
+    case window(CGWindowID)
+}
+
 struct RecordingItem: Identifiable {
     let id = UUID()
     let url: URL
@@ -460,6 +642,9 @@ struct MainView: View {
                 }
                 .padding(32)
             }
+        }
+        .onAppear {
+            Task { await model.refreshWindowOptions() }
         }
     }
 
@@ -654,30 +839,81 @@ struct MainView: View {
     }
 
     private var captureAreaControl: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "crop")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(freshMint)
-                .frame(width: 30, height: 30)
-                .background(freshMint.opacity(0.13), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("录制范围")
-                    .font(.system(size: 13, weight: .semibold))
-                Text(model.captureAreaDescription)
-                    .font(.caption)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Image(systemName: "crop")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(freshMint)
+                    .frame(width: 30, height: 30)
+                    .background(freshMint.opacity(0.13), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("录制范围")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(model.captureAreaDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Button("选择区域") {
+                    model.selectCaptureRegion()
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isRecording || model.isBusy)
+                Button("全屏") {
+                    model.clearCaptureRegion()
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isRecording || model.isBusy || (model.selectedCaptureRect == nil && model.selectedWindowID == nil))
+            }
+
+            HStack(spacing: 10) {
+                Text("比例模板")
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
+                ForEach(CaptureAreaPreset.allCases) { preset in
+                    Button(preset.label) {
+                        model.applyCapturePreset(preset)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.isRecording || model.isBusy)
+                }
             }
-            Spacer()
-            Button("选择区域") {
-                model.selectCaptureRegion()
+
+            HStack(spacing: 10) {
+                Text("窗口录制")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Menu {
+                    Button("刷新窗口列表") {
+                        Task { await model.refreshWindowOptions() }
+                    }
+                    Divider()
+                    if model.windowOptions.isEmpty {
+                        Text("暂无可选窗口")
+                    } else {
+                        ForEach(model.windowOptions) { option in
+                            Button(option.displayName) {
+                                model.selectWindow(option)
+                            }
+                        }
+                    }
+                } label: {
+                    Label(model.selectedWindowDescription, systemImage: "macwindow")
+                        .lineLimit(1)
+                }
+                .menuStyle(.borderlessButton)
+                .disabled(model.isRecording || model.isBusy || model.isRefreshingWindows)
+
+                Button {
+                    Task { await model.refreshWindowOptions() }
+                } label: {
+                    Image(systemName: model.isRefreshingWindows ? "hourglass" : "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .disabled(model.isRecording || model.isBusy || model.isRefreshingWindows)
             }
-            .buttonStyle(.bordered)
-            .disabled(model.isRecording || model.isBusy)
-            Button("全屏") {
-                model.clearCaptureRegion()
-            }
-            .buttonStyle(.borderless)
-            .disabled(model.isRecording || model.isBusy || model.selectedCaptureRect == nil)
         }
         .padding(.vertical, 9)
         .padding(.horizontal, 10)
@@ -1297,6 +1533,7 @@ struct AutoScrollingTeleprompterView: NSViewRepresentable {
 
 enum RecorderError: LocalizedError {
     case noDisplay
+    case windowNotFound
     case writerNotReady
     case screenRecordingPermission
     case saveFailed(String)
@@ -1305,6 +1542,8 @@ enum RecorderError: LocalizedError {
         switch self {
         case .noDisplay:
             return "没有找到可录制的显示器。"
+        case .windowNotFound:
+            return "选择的窗口已经关闭或不可录制，请重新刷新窗口列表后再选。"
         case .writerNotReady:
             return "录制文件还没有准备好。"
         case .screenRecordingPermission:
@@ -1336,7 +1575,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         stream != nil || writer != nil
     }
 
-    func start(includeSystemAudio: Bool, includeMicrophone: Bool, microphoneDeviceID: String?, captureRect: CGRect?) async throws -> URL {
+    func start(includeSystemAudio: Bool, includeMicrophone: Bool, microphoneDeviceID: String?, captureTarget: RecorderCaptureTarget) async throws -> URL {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else { throw RecorderError.noDisplay }
 
@@ -1344,10 +1583,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         let writer = try AVAssetWriter(outputURL: destination.temporaryURL, fileType: .mp4)
         writer.shouldOptimizeForNetworkUse = true
 
-        let displayFrame = display.frame
-        let sourceRect = normalizedSourceRect(captureRect, displayFrame: displayFrame)
-        let width = Int(sourceRect.width)
-        let height = Int(sourceRect.height)
+        let captureSetup = try makeCaptureSetup(
+            target: captureTarget,
+            content: content,
+            display: display
+        )
+        let width = captureSetup.width
+        let height = captureSetup.height
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
@@ -1394,11 +1636,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             microphoneInput = input
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
-        if captureRect != nil {
+        if let sourceRect = captureSetup.sourceRect {
             config.sourceRect = sourceRect
             config.destinationRect = CGRect(x: 0, y: 0, width: width, height: height)
         }
@@ -1413,7 +1654,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         config.sampleRate = 48_000
         config.channelCount = 2
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let stream = SCStream(filter: captureSetup.filter, configuration: config, delegate: nil)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         if includeSystemAudio {
             try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
@@ -1615,6 +1856,48 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 
     private func writerDiagnostics() -> String {
         "样本统计：画面 \(videoSampleCount)，系统声 \(audioSampleCount)，麦克风 \(microphoneSampleCount)"
+    }
+
+    private func makeCaptureSetup(
+        target: RecorderCaptureTarget,
+        content: SCShareableContent,
+        display: SCDisplay
+    ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int) {
+        switch target {
+        case .display(let captureRect):
+            let displayFrame = display.frame
+            let sourceRect = normalizedSourceRect(captureRect, displayFrame: displayFrame)
+            let size = normalizedVideoSize(from: sourceRect.size)
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+            return (
+                filter: filter,
+                sourceRect: captureRect == nil ? nil : sourceRect,
+                width: size.width,
+                height: size.height
+            )
+
+        case .window(let windowID):
+            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+                throw RecorderError.windowNotFound
+            }
+
+            let size = normalizedVideoSize(from: window.frame.size)
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            return (
+                filter: filter,
+                sourceRect: nil,
+                width: size.width,
+                height: size.height
+            )
+        }
+    }
+
+    private func normalizedVideoSize(from size: CGSize) -> (width: Int, height: Int) {
+        let rawWidth = max(80, Int(size.width.rounded(.down)))
+        let rawHeight = max(80, Int(size.height.rounded(.down)))
+        let width = max(80, rawWidth - rawWidth % 2)
+        let height = max(80, rawHeight - rawHeight % 2)
+        return (width, height)
     }
 
     private func normalizedSourceRect(_ captureRect: CGRect?, displayFrame: CGRect) -> CGRect {
