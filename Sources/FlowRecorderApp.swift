@@ -119,6 +119,7 @@ final class AppModel: ObservableObject {
     @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID
     @Published var selectedCaptureRect: CGRect?
     @Published var selectedWindowID: CGWindowID?
+    @Published var selectedWindowFrame: CGRect?
     @Published var windowOptions: [WindowCaptureOption] = []
     @Published var isRefreshingWindows = false
     @Published var teleprompterFontSize = 28.0
@@ -177,7 +178,7 @@ final class AppModel: ObservableObject {
             let microphoneDeviceID = includeMicrophone ? selectedMicrophoneDevice?.uniqueID : nil
             let captureTarget: RecorderCaptureTarget = {
                 if let selectedWindowID {
-                    return .window(selectedWindowID)
+                    return .window(id: selectedWindowID, fallbackFrame: selectedWindowFrame)
                 }
                 return .display(rect: selectedCaptureRect)
             }()
@@ -250,7 +251,7 @@ final class AppModel: ObservableObject {
 
     var captureModeHelp: String {
         if selectedWindowID != nil {
-            return "只录选中的窗口，窗口移动或内容变化都会跟着录。"
+            return "按窗口当前位置录制真实画面，页面跳转和视频播放会录进去。"
         }
         if selectedCaptureRect != nil {
             return "只录固定区域，适合短视频画幅或局部演示。"
@@ -304,6 +305,7 @@ final class AppModel: ObservableObject {
     func clearCaptureRegion() {
         guard !isRecording, !isBusy else { return }
         selectedWindowID = nil
+        selectedWindowFrame = nil
         selectedCaptureRect = nil
         status = "录制范围已恢复为全屏。"
     }
@@ -311,6 +313,7 @@ final class AppModel: ObservableObject {
     func applyCapturePreset(_ preset: CaptureAreaPreset) {
         guard !isRecording, !isBusy else { return }
         selectedWindowID = nil
+        selectedWindowFrame = nil
 
         guard let screenFrame = NSScreen.main?.frame else {
             selectedCaptureRect = nil
@@ -341,6 +344,7 @@ final class AppModel: ObservableObject {
             let options = content.windows.compactMap { window -> WindowCaptureOption? in
                 guard let app = window.owningApplication,
                       app.processID != ownPID,
+                      !WindowCaptureOption.isSystemUtility(appName: app.applicationName),
                       window.frame.width >= 160,
                       window.frame.height >= 100 else {
                     return nil
@@ -352,8 +356,7 @@ final class AppModel: ObservableObject {
                     id: window.windowID,
                     appName: app.applicationName,
                     title: safeTitle,
-                    width: Int(window.frame.width),
-                    height: Int(window.frame.height)
+                    frame: window.frame
                 )
             }
 
@@ -368,6 +371,7 @@ final class AppModel: ObservableObject {
 
             if let selectedWindowID, !windowOptions.contains(where: { $0.id == selectedWindowID }) {
                 self.selectedWindowID = nil
+                selectedWindowFrame = nil
                 selectedCaptureRect = nil
                 status = "原窗口已关闭，录制范围已恢复为全屏。"
             } else if !windowOptions.isEmpty {
@@ -383,8 +387,9 @@ final class AppModel: ObservableObject {
     func selectWindow(_ option: WindowCaptureOption) {
         guard !isRecording, !isBusy else { return }
         selectedWindowID = option.id
+        selectedWindowFrame = option.frame
         selectedCaptureRect = nil
-        status = "已选择窗口录制：\(option.displayName)。窗口移动后请重新选择一次。"
+        status = "已选择窗口区域：\(option.displayName)。页面播放会录进去；移动窗口后请重新选择。"
     }
 
     func reveal(_ item: RecordingItem) {
@@ -568,8 +573,10 @@ struct WindowCaptureOption: Identifiable, Hashable {
     let id: CGWindowID
     let appName: String
     let title: String
-    let width: Int
-    let height: Int
+    let frame: CGRect
+
+    var width: Int { Int(frame.width) }
+    var height: Int { Int(frame.height) }
 
     var shortName: String {
         title == "未命名窗口" ? appName : title
@@ -578,11 +585,26 @@ struct WindowCaptureOption: Identifiable, Hashable {
     var displayName: String {
         "\(appName) · \(shortName) · \(width)×\(height)"
     }
+
+    static func isSystemUtility(appName: String) -> Bool {
+        let blockedNames: Set<String> = [
+            "程序坞",
+            "Dock",
+            "控制中心",
+            "Control Center",
+            "通知中心",
+            "Notification Center",
+            "universalAccessAuthWarn",
+            "Window Server",
+            "SystemUIServer"
+        ]
+        return blockedNames.contains(appName)
+    }
 }
 
 enum RecorderCaptureTarget {
     case display(rect: CGRect?)
-    case window(CGWindowID)
+    case window(id: CGWindowID, fallbackFrame: CGRect?)
 }
 
 struct RecordingItem: Identifiable {
@@ -1113,7 +1135,7 @@ struct WindowPickerSheet: View {
                     Text("选择要录制的窗口")
                         .font(.system(size: 22, weight: .semibold, design: .rounded))
                         .foregroundStyle(ink)
-                    Text("适合录 PPT、微信、浏览器、Codex。窗口移动后，重新选择一次更稳。")
+                    Text("适合录 PPT、微信、浏览器、Codex。按窗口当前区域录真实画面，播放/跳转能录进去。")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -1162,7 +1184,7 @@ struct WindowPickerSheet: View {
 
             Divider().opacity(0.45)
             HStack(spacing: 10) {
-                Label("提示：如果窗口没出现，先把目标窗口点到前台，再点刷新；如果移动窗口，录制前重新选择。", systemImage: "lightbulb")
+                Label("提示：选窗口后请不要遮挡它；如果移动窗口，录制前重新选择一次。", systemImage: "lightbulb")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -2054,14 +2076,19 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 height: size.height
             )
 
-        case .window(let windowID):
-            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+        case .window(let windowID, let fallbackFrame):
+            let liveFrame = content.windows.first(where: { $0.windowID == windowID })?.frame
+            guard let windowFrame = liveFrame ?? fallbackFrame else {
                 throw RecorderError.windowNotFound
             }
 
-            let sourceRect = normalizedSourceRect(window.frame, displayFrame: display.frame)
+            let sourceRect = normalizedSourceRect(windowFrame, displayFrame: display.frame)
             let size = normalizedVideoSize(from: sourceRect.size)
-            let filter = SCContentFilter(display: display, including: [window])
+            // Window capture is intentionally implemented as a stable screen-region capture.
+            // Some apps (notably video/web apps) swap rendering layers or open a new player
+            // surface after navigation. Capturing the real screen region records what the
+            // user actually sees instead of freezing on the originally selected window object.
+            let filter = SCContentFilter(display: display, excludingWindows: [])
             return (
                 filter: filter,
                 sourceRect: sourceRect,
