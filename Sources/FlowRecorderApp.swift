@@ -1763,6 +1763,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private var startTime: CMTime?
     private var finalOutputURL: URL?
     private var temporaryOutputURL: URL?
+    private var postCropRect: CGRect?
     private var expectedAudioTrackCount = 0
     private var videoSampleCount = 0
     private var audioSampleCount = 0
@@ -1870,6 +1871,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         self.microphoneInput = microphoneInput
         self.finalOutputURL = destination.finalURL
         self.temporaryOutputURL = destination.temporaryURL
+        self.postCropRect = captureSetup.postCropRect
         self.expectedAudioTrackCount = (includeSystemAudio ? 1 : 0) + (includeMicrophone ? 1 : 0)
         self.videoSampleCount = 0
         self.audioSampleCount = 0
@@ -1894,6 +1896,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             throw RecorderError.writerNotReady
         }
 
+        var filesToQuarantine = [temporaryOutputURL]
         do {
             var stopCaptureError: Error?
             do {
@@ -1905,11 +1908,25 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             let actualAudioTrackCount = currentExpectedWrittenAudioTrackCount()
             try await finishWriter(writer)
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: actualAudioTrackCount)
+
+            var workingURL = temporaryOutputURL
+            if let postCropRect {
+                let croppedURL = temporaryOutputURL.deletingLastPathComponent()
+                    .appendingPathComponent("\(temporaryOutputURL.deletingPathExtension().lastPathComponent)-cropped.mp4")
+                filesToQuarantine.append(croppedURL)
+                try await exportCroppedMovie(from: temporaryOutputURL, to: croppedURL, cropRect: postCropRect)
+                try await validatePlayableMovie(at: croppedURL, expectedAudioTracks: actualAudioTrackCount)
+                workingURL = croppedURL
+            }
+
             let savedURL: URL
             if actualAudioTrackCount > 1 {
-                savedURL = try await saveMixedPlaybackAndSplitTrackVersions(from: temporaryOutputURL, to: finalOutputURL)
+                savedURL = try await saveMixedPlaybackAndSplitTrackVersions(from: workingURL, to: finalOutputURL)
             } else {
-                savedURL = try commitTemporaryRecording(from: temporaryOutputURL, to: finalOutputURL)
+                savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
+            }
+            for url in filesToQuarantine where url != savedURL {
+                try? FileManager.default.removeItem(at: url)
             }
             if let stopCaptureError {
                 appendRecorderNote("stopCapture 抛错但文件已成功封装：\(saveFailureText(from: stopCaptureError))")
@@ -1918,7 +1935,10 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             return savedURL
         } catch {
             cancelWriterIfNeeded(writer)
-            let moved = quarantineBrokenFile(temporaryOutputURL)
+            var moved: URL?
+            for url in filesToQuarantine {
+                moved = quarantineBrokenFile(url) ?? moved
+            }
             resetAfterStop()
             throw RecorderError.saveFailed(failureMessage(saveFailureText(from: error), moved: moved))
         }
@@ -2062,18 +2082,20 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         target: RecorderCaptureTarget,
         content: SCShareableContent,
         display: SCDisplay
-    ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int) {
+    ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int, postCropRect: CGRect?) {
+        let displayFrame = display.frame
+        let fullSize = normalizedVideoSize(from: displayFrame.size)
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+
         switch target {
         case .display(let captureRect):
-            let displayFrame = display.frame
-            let sourceRect = normalizedSourceRect(captureRect, displayFrame: displayFrame)
-            let size = normalizedVideoSize(from: sourceRect.size)
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            let postCropRect = captureRect.map { normalizedSourceRect($0, displayFrame: displayFrame) }
             return (
                 filter: filter,
-                sourceRect: captureRect == nil ? nil : sourceRect,
-                width: size.width,
-                height: size.height
+                sourceRect: nil,
+                width: fullSize.width,
+                height: fullSize.height,
+                postCropRect: postCropRect
             )
 
         case .window(let windowID, let fallbackFrame):
@@ -2083,17 +2105,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             }
 
             let sourceRect = normalizedSourceRect(windowFrame, displayFrame: display.frame)
-            let size = normalizedVideoSize(from: sourceRect.size)
-            // Window capture is intentionally implemented as a stable screen-region capture.
-            // Some apps (notably video/web apps) swap rendering layers or open a new player
-            // surface after navigation. Capturing the real screen region records what the
-            // user actually sees instead of freezing on the originally selected window object.
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            // Window selection is intentionally implemented as stable full-screen capture
+            // followed by a crop. Some apps (notably video/web apps) swap rendering layers
+            // after navigation. Keeping the live capture path identical to full-screen
+            // recording avoids random writer failures and records the visible screen region.
             return (
                 filter: filter,
-                sourceRect: sourceRect,
-                width: size.width,
-                height: size.height
+                sourceRect: nil,
+                width: fullSize.width,
+                height: fullSize.height,
+                postCropRect: sourceRect
             )
         }
     }
@@ -2176,6 +2197,76 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     func splitTrackSiblingURL(for url: URL) -> URL {
         let baseName = url.deletingPathExtension().lastPathComponent
         return url.deletingLastPathComponent().appendingPathComponent("\(baseName)_分轨版.mp4")
+    }
+
+    private func exportCroppedMovie(from sourceURL: URL, to outputURL: URL, cropRect: CGRect) async throws {
+        try? FileManager.default.removeItem(at: outputURL)
+
+        let asset = AVURLAsset(url: sourceURL)
+        let duration = try await asset.load(.duration)
+        let videoTracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+
+        guard let videoTrack = videoTracks.first else {
+            throw RecorderError.saveFailed("裁剪前没有找到视频轨")
+        }
+
+        let naturalSize = try await videoTrack.load(.naturalSize)
+        let fullRect = CGRect(origin: .zero, size: naturalSize)
+        var crop = cropRect.integral.intersection(fullRect)
+        guard crop.width >= 80, crop.height >= 80 else {
+            throw RecorderError.saveFailed("裁剪区域无效")
+        }
+
+        crop.size.width = CGFloat(max(80, Int(crop.width) - Int(crop.width) % 2))
+        crop.size.height = CGFloat(max(80, Int(crop.height) - Int(crop.height) % 2))
+
+        let composition = AVMutableComposition()
+        guard let compositionVideoTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            throw RecorderError.saveFailed("裁剪视频轨初始化失败")
+        }
+
+        try compositionVideoTrack.insertTimeRange(
+            CMTimeRange(start: .zero, duration: duration),
+            of: videoTrack,
+            at: .zero
+        )
+
+        for audioTrack in audioTracks {
+            guard let compositionAudioTrack = composition.addMutableTrack(
+                withMediaType: .audio,
+                preferredTrackID: kCMPersistentTrackID_Invalid
+            ) else {
+                throw RecorderError.saveFailed("裁剪音频轨初始化失败")
+            }
+            try compositionAudioTrack.insertTimeRange(
+                CMTimeRange(start: .zero, duration: duration),
+                of: audioTrack,
+                at: .zero
+            )
+        }
+
+        let instruction = AVMutableVideoCompositionInstruction()
+        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
+        layerInstruction.setTransform(CGAffineTransform(translationX: -crop.minX, y: -crop.minY), at: .zero)
+        instruction.layerInstructions = [layerInstruction]
+
+        let videoComposition = AVMutableVideoComposition()
+        videoComposition.renderSize = crop.size
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        videoComposition.instructions = [instruction]
+
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+            throw RecorderError.saveFailed("裁剪导出器初始化失败")
+        }
+
+        exporter.videoComposition = videoComposition
+        exporter.shouldOptimizeForNetworkUse = true
+        try await exporter.export(to: outputURL, as: .mp4)
     }
 
     private func saveMixedPlaybackAndSplitTrackVersions(from temporaryURL: URL, to finalURL: URL) async throws -> URL {
@@ -2289,6 +2380,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         startTime = nil
         finalOutputURL = nil
         temporaryOutputURL = nil
+        postCropRect = nil
         expectedAudioTrackCount = 0
         videoSampleCount = 0
         audioSampleCount = 0
