@@ -731,42 +731,37 @@ struct MainView: View {
     @State private var windowSearchText = ""
 
     private let panelRadius: CGFloat = 18
-    private let freshBlue = Color(red: 0.16, green: 0.48, blue: 0.95)
-    private let freshMint = Color(red: 0.13, green: 0.72, blue: 0.67)
-    private let freshIndigo = Color(red: 0.44, green: 0.42, blue: 0.92)
-    private let ink = Color(red: 0.13, green: 0.17, blue: 0.23)
+    private let freshBlue = Color(red: 0.08, green: 0.40, blue: 0.76)
+    private let freshMint = Color(red: 0.06, green: 0.56, blue: 0.48)
+    private let freshIndigo = Color(red: 0.34, green: 0.31, blue: 0.62)
+    private let ink = Color(red: 0.10, green: 0.12, blue: 0.16)
+    private let canvas = Color(red: 0.94, green: 0.95, blue: 0.96)
+    private let surface = Color(red: 0.99, green: 0.99, blue: 0.985)
+    private let panelBorder = Color.black.opacity(0.09)
+    private let console = Color(red: 0.075, green: 0.085, blue: 0.105)
 
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [
-                    Color(red: 0.96, green: 0.99, blue: 1.00),
-                    Color(red: 0.91, green: 0.98, blue: 0.98),
-                    Color(red: 0.98, green: 0.97, blue: 1.00)
-                ],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-            .ignoresSafeArea()
+            canvas.ignoresSafeArea()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 14) {
                     header
-                    HStack(alignment: .top, spacing: 16) {
-                        recordingHero.frame(minWidth: 290, maxWidth: 330)
-                        VStack(spacing: 16) {
+                    HStack(alignment: .top, spacing: 14) {
+                        recordingHero.frame(minWidth: 312, maxWidth: 348)
+                        VStack(spacing: 14) {
                             quickTools
                             sourcePanel
                         }
                         .frame(maxWidth: .infinity)
                     }
-                    HStack(alignment: .top, spacing: 16) {
+                    HStack(alignment: .top, spacing: 14) {
                         teleprompterPanel.frame(maxWidth: .infinity)
-                        recordingsPanel.frame(width: 380)
+                        recordingsPanel.frame(width: 400)
                     }
                     statusBox
                 }
-                .padding(32)
+                .padding(24)
             }
         }
         .onAppear {
@@ -785,22 +780,20 @@ struct MainView: View {
     private var header: some View {
         HStack(alignment: .center, spacing: 16) {
             ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .fill(.white.opacity(0.92))
-                    .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(freshBlue.opacity(0.10), lineWidth: 1))
-                    .shadow(color: freshBlue.opacity(0.08), radius: 10, x: 0, y: 6)
+                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                    .fill(console)
                 Image(systemName: "record.circle.fill")
-                    .font(.system(size: 28, weight: .semibold))
-                    .foregroundStyle(.red, freshBlue)
+                    .font(.system(size: 25, weight: .semibold))
+                    .foregroundStyle(Color(red: 1.0, green: 0.30, blue: 0.31))
             }
-            .frame(width: 52, height: 52)
+            .frame(width: 48, height: 48)
 
             VStack(alignment: .leading, spacing: 5) {
                 Text("录屏大师Jack")
-                    .font(.system(size: 29, weight: .semibold, design: .rounded))
+                    .font(.system(size: 27, weight: .bold, design: .rounded))
                     .foregroundStyle(ink)
-                Text("轻量录屏、清晰收声、悬浮摄像头和可滚动提词器。")
-                    .font(.system(size: 14, weight: .medium))
+                Text("录制、收声、提词和窗口捕捉。")
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
                 copyrightNotice
                     .padding(.top, 3)
@@ -819,39 +812,42 @@ struct MainView: View {
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(Color.primary.opacity(0.74))
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 9)
-        .background(.white.opacity(0.88), in: Capsule())
-        .overlay(Capsule().stroke(tint.opacity(0.12), lineWidth: 1))
-        .shadow(color: tint.opacity(0.10), radius: 12, x: 0, y: 6)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .background(surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(0.22), lineWidth: 1))
     }
 
     private var recordingHero: some View {
-        freshPanel {
-            VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 20) {
                 VStack(alignment: .leading, spacing: 6) {
+                    Text("录制控制")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.58))
                     Text(model.isRecording ? "正在录制" : (model.isCountingDown ? "即将开始" : "准备开始"))
-                        .font(.system(size: 24, weight: .semibold, design: .rounded))
+                        .font(.system(size: 25, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
                     Text(model.isRecording ? "录制中请保持窗口状态稳定" : (model.isCountingDown ? "倒计时期间点击按钮即可取消" : "确认来源后，3 秒倒计时开始录制"))
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.white.opacity(0.64))
                 }
                 Button {
                     model.toggleRecording()
                 } label: {
                     ZStack {
                         Circle()
-                            .fill(model.isRecording ? Color.red.gradient : (model.isCountingDown ? Color.orange.gradient : freshBlue.gradient))
-                            .frame(width: 108, height: 108)
-                            .shadow(color: (model.isRecording ? Color.red : (model.isCountingDown ? Color.orange : freshBlue)).opacity(0.22), radius: 20, x: 0, y: 12)
+                            .fill(model.isRecording ? Color(red: 1.0, green: 0.29, blue: 0.31) : (model.isCountingDown ? Color.orange : Color.white))
+                            .frame(width: 118, height: 118)
+                            .overlay(Circle().stroke(.white.opacity(model.isRecording ? 0.30 : 0.0), lineWidth: 8))
+                            .shadow(color: .black.opacity(0.24), radius: 18, x: 0, y: 10)
                         if let seconds = model.countdownSeconds {
                             Text("\(seconds)")
                                 .font(.system(size: 48, weight: .bold, design: .rounded))
-                                .foregroundStyle(.white)
+                                .foregroundStyle(model.isCountingDown ? .white : console)
                         } else {
                             Image(systemName: model.isRecording ? "stop.fill" : "record.circle")
                                 .font(.system(size: 44, weight: .semibold))
-                                .foregroundStyle(.white)
+                                .foregroundStyle(model.isRecording ? .white : console)
                         }
                     }
                     .frame(maxWidth: .infinity)
@@ -866,13 +862,15 @@ struct MainView: View {
                     Text(model.isCountingDown ? "即将录制" : (model.isBusy ? "正在处理..." : "状态稳定"))
                 }
                 .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
-            }
+                .foregroundStyle(.white.opacity(0.65))
         }
+        .padding(22)
+        .background(console, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
     }
 
     private var quickTools: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             actionButton(
                 title: model.isRecording ? "摄像头锁定" : (cameraShown ? "关闭摄像头" : "摄像头小窗"),
                 subtitle: model.isRecording ? "录制前设置" : "圆形悬浮",
@@ -909,19 +907,18 @@ struct MainView: View {
                 Image(systemName: icon)
                     .font(.system(size: 21, weight: .semibold))
                     .foregroundStyle(tint)
-                    .frame(width: 40, height: 40)
-                    .background(tint.opacity(0.13), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    .frame(width: 36, height: 36)
+                    .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
                     Text(subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer()
             }
-            .padding(13)
+            .padding(11)
             .frame(maxWidth: .infinity)
-            .background(.white.opacity(0.78), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(tint.opacity(0.12), lineWidth: 1))
-            .shadow(color: tint.opacity(0.06), radius: 8, x: 0, y: 5)
+            .background(surface, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(panelBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -975,7 +972,8 @@ struct MainView: View {
         }
         .padding(.vertical, 8)
         .padding(.horizontal, 10)
-        .background(Color.white.opacity(0.56), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(canvas.opacity(0.72), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(panelBorder.opacity(0.75), lineWidth: 1))
     }
 
     private var captureAreaControl: some View {
@@ -1075,7 +1073,8 @@ struct MainView: View {
         }
         .padding(.vertical, 9)
         .padding(.horizontal, 10)
-        .background(Color.white.opacity(0.56), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .background(canvas.opacity(0.72), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(panelBorder.opacity(0.75), lineWidth: 1))
     }
 
     private func sourceToggleCard(title: String, subtitle: String, icon: String, tint: Color, isOn: Binding<Bool>) -> some View {
@@ -1118,8 +1117,8 @@ struct MainView: View {
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 150)
                     .padding(12)
-                    .background(Color.white.opacity(0.86), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(freshBlue.opacity(0.08), lineWidth: 1))
+                    .background(canvas.opacity(0.62), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(panelBorder, lineWidth: 1))
                     .onChange(of: model.teleprompterText) { _, _ in syncTeleprompter() }
                 Text("滚动为 0 时手动滚动；录制期间锁定提词器设置，避免窗口变化导致录制异常。")
                     .font(.caption)
@@ -1172,8 +1171,8 @@ struct MainView: View {
         }
         .padding(.vertical, 9)
         .padding(.horizontal, 10)
-        .background(Color.white.opacity(0.70), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(freshBlue.opacity(0.07), lineWidth: 1))
+        .background(canvas.opacity(0.68), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(panelBorder, lineWidth: 1))
     }
 
     private var statusBox: some View {
@@ -1220,10 +1219,10 @@ struct MainView: View {
 
     private func freshPanel<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         content()
-            .padding(18)
-            .background(Color.white.opacity(0.78), in: RoundedRectangle(cornerRadius: panelRadius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: panelRadius, style: .continuous).stroke(Color.white.opacity(0.92), lineWidth: 1))
-            .shadow(color: Color(red: 0.36, green: 0.57, blue: 0.78).opacity(0.075), radius: 14, x: 0, y: 8)
+            .padding(16)
+            .background(surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(panelBorder, lineWidth: 1))
+            .shadow(color: .black.opacity(0.045), radius: 6, x: 0, y: 3)
     }
 
     private func syncTeleprompter() {
