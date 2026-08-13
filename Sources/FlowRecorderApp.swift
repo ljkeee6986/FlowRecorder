@@ -192,6 +192,7 @@ final class AppModel: ObservableObject {
     """
 
     private static let minimumFreeDiskSpaceBytes: Int64 = 500 * 1_024 * 1_024
+    private static let diagnosticsTailReadLimitBytes: UInt64 = 256 * 1_024
 
     var isCountingDown: Bool {
         countdownSeconds != nil
@@ -717,11 +718,36 @@ final class AppModel: ObservableObject {
     }
 
     private func diagnosticsLogTail(maxLines: Int) -> String {
-        guard let text = try? String(contentsOf: diagnosticsLogURL, encoding: .utf8) else {
+        guard let handle = try? FileHandle(forReadingFrom: diagnosticsLogURL) else {
             return "- status.txt unreadable"
         }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        return lines.suffix(maxLines).joined(separator: "\n")
+        defer { try? handle.close() }
+
+        do {
+            let fileSize = try handle.seekToEnd()
+            let startOffset = fileSize > Self.diagnosticsTailReadLimitBytes
+                ? fileSize - Self.diagnosticsTailReadLimitBytes
+                : 0
+            try handle.seek(toOffset: startOffset)
+            let data = try handle.readToEnd() ?? Data()
+            var text = String(decoding: data, as: UTF8.self)
+
+            if startOffset > 0, let firstNewline = text.firstIndex(of: "\n") {
+                text = String(text[text.index(after: firstNewline)...])
+            }
+
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            let tail = lines.suffix(maxLines).joined(separator: "\n")
+            guard startOffset > 0 else { return tail }
+
+            let limit = ByteCountFormatter.string(
+                fromByteCount: Int64(Self.diagnosticsTailReadLimitBytes),
+                countStyle: .file
+            )
+            return "[status.txt 较长，仅读取最近 \(limit)]\n\(tail)"
+        } catch {
+            return "- status.txt unreadable: \(error.localizedDescription)"
+        }
     }
 
     var selectedWindowDescription: String {
