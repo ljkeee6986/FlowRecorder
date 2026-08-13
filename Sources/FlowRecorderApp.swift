@@ -116,6 +116,7 @@ final class AppModel: ObservableObject {
     @Published var recentRecordings: [RecordingItem] = []
     @Published var includeSystemAudio = true
     @Published var includeMicrophone = false
+    @Published var outputResolution = OutputResolutionPreset.native
     @Published var microphoneDevices: [MicrophoneDevice] = []
     @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID
     @Published var selectedCaptureRect: CGRect?
@@ -198,7 +199,8 @@ final class AppModel: ObservableObject {
                 includeSystemAudio: includeSystemAudio,
                 includeMicrophone: includeMicrophone,
                 microphoneDeviceID: microphoneDeviceID,
-                captureTarget: captureTarget
+                captureTarget: captureTarget,
+                outputResolution: outputResolution
             )
             outputURL = nil
             isRecording = true
@@ -602,6 +604,54 @@ enum CaptureAreaPreset: String, CaseIterable, Identifiable {
     }
 }
 
+enum OutputResolutionPreset: String, CaseIterable, Identifiable {
+    case native
+    case p1080
+    case p720
+    case p540
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .native:
+            return "原画"
+        case .p1080:
+            return "最高 1080P"
+        case .p720:
+            return "最高 720P"
+        case .p540:
+            return "最高 540P"
+        }
+    }
+
+    var maximumLongEdge: CGFloat? {
+        switch self {
+        case .native:
+            return nil
+        case .p1080:
+            return 1_920
+        case .p720:
+            return 1_280
+        case .p540:
+            return 960
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .native:
+            return "保持录制范围的原始尺寸"
+        case .p1080:
+            return "最长边不超过 1920，适合课程和演示"
+        case .p720:
+            return "最长边不超过 1280，文件更小"
+        case .p540:
+            return "最长边不超过 960，适合快速分享"
+        }
+    }
+}
+
 struct WindowCaptureOption: Identifiable, Hashable {
     let id: CGWindowID
     let appName: String
@@ -964,6 +1014,31 @@ struct MainView: View {
                     .controlSize(.small)
                     .disabled(model.isRecording || model.isBusy)
                 }
+            }
+
+            HStack(spacing: 10) {
+                Image(systemName: "rectangle.compress.vertical")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(freshBlue)
+                    .frame(width: 30, height: 30)
+                    .background(freshBlue.opacity(0.13), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("导出清晰度")
+                        .font(.system(size: 13, weight: .semibold))
+                    Text(model.outputResolution.detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                Picker("", selection: $model.outputResolution) {
+                    ForEach(OutputResolutionPreset.allCases) { preset in
+                        Text(preset.label).tag(preset)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 110)
+                .disabled(model.isRecording || model.isBusy)
             }
 
             HStack(spacing: 10) {
@@ -1803,6 +1878,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private var finalOutputURL: URL?
     private var temporaryOutputURL: URL?
     private var postCropRect: CGRect?
+    private var outputResolution = OutputResolutionPreset.native
     private var expectedAudioTrackCount = 0
     private var videoSampleCount = 0
     private var audioSampleCount = 0
@@ -1815,7 +1891,13 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         stream != nil || writer != nil
     }
 
-    func start(includeSystemAudio: Bool, includeMicrophone: Bool, microphoneDeviceID: String?, captureTarget: RecorderCaptureTarget) async throws -> URL {
+    func start(
+        includeSystemAudio: Bool,
+        includeMicrophone: Bool,
+        microphoneDeviceID: String?,
+        captureTarget: RecorderCaptureTarget,
+        outputResolution: OutputResolutionPreset
+    ) async throws -> URL {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else { throw RecorderError.noDisplay }
 
@@ -1911,6 +1993,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         self.finalOutputURL = destination.finalURL
         self.temporaryOutputURL = destination.temporaryURL
         self.postCropRect = captureSetup.postCropRect
+        self.outputResolution = outputResolution
         self.expectedAudioTrackCount = (includeSystemAudio ? 1 : 0) + (includeMicrophone ? 1 : 0)
         self.videoSampleCount = 0
         self.audioSampleCount = 0
@@ -1949,13 +2032,18 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: actualAudioTrackCount)
 
             var workingURL = temporaryOutputURL
-            if let postCropRect {
-                let croppedURL = temporaryOutputURL.deletingLastPathComponent()
-                    .appendingPathComponent("\(temporaryOutputURL.deletingPathExtension().lastPathComponent)-cropped.mp4")
-                filesToQuarantine.append(croppedURL)
-                try await exportCroppedMovie(from: temporaryOutputURL, to: croppedURL, cropRect: postCropRect)
-                try await validatePlayableMovie(at: croppedURL, expectedAudioTracks: actualAudioTrackCount)
-                workingURL = croppedURL
+            if postCropRect != nil || outputResolution.maximumLongEdge != nil {
+                let processedURL = temporaryOutputURL.deletingLastPathComponent()
+                    .appendingPathComponent("\(temporaryOutputURL.deletingPathExtension().lastPathComponent)-processed.mp4")
+                filesToQuarantine.append(processedURL)
+                try await exportProcessedMovie(
+                    from: temporaryOutputURL,
+                    to: processedURL,
+                    cropRect: postCropRect,
+                    maximumLongEdge: outputResolution.maximumLongEdge
+                )
+                try await validatePlayableMovie(at: processedURL, expectedAudioTracks: actualAudioTrackCount)
+                workingURL = processedURL
             }
 
             let savedURL: URL
@@ -2238,7 +2326,12 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         return url.deletingLastPathComponent().appendingPathComponent("\(baseName)_分轨版.mp4")
     }
 
-    private func exportCroppedMovie(from sourceURL: URL, to outputURL: URL, cropRect: CGRect) async throws {
+    private func exportProcessedMovie(
+        from sourceURL: URL,
+        to outputURL: URL,
+        cropRect: CGRect?,
+        maximumLongEdge: CGFloat?
+    ) async throws {
         try? FileManager.default.removeItem(at: outputURL)
 
         let asset = AVURLAsset(url: sourceURL)
@@ -2252,13 +2345,15 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 
         let naturalSize = try await videoTrack.load(.naturalSize)
         let fullRect = CGRect(origin: .zero, size: naturalSize)
-        var crop = cropRect.integral.intersection(fullRect)
+        var crop = (cropRect ?? fullRect).integral.intersection(fullRect)
         guard crop.width >= 80, crop.height >= 80 else {
             throw RecorderError.saveFailed("裁剪区域无效")
         }
 
         crop.size.width = CGFloat(max(80, Int(crop.width) - Int(crop.width) % 2))
         crop.size.height = CGFloat(max(80, Int(crop.height) - Int(crop.height) % 2))
+        let renderSize = scaledRenderSize(for: crop.size, maximumLongEdge: maximumLongEdge)
+        let scale = renderSize.width / crop.width
 
         let composition = AVMutableComposition()
         guard let compositionVideoTrack = composition.addMutableTrack(
@@ -2291,11 +2386,21 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         let instruction = AVMutableVideoCompositionInstruction()
         instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
         let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
-        layerInstruction.setTransform(CGAffineTransform(translationX: -crop.minX, y: -crop.minY), at: .zero)
+        layerInstruction.setTransform(
+            CGAffineTransform(
+                a: scale,
+                b: 0,
+                c: 0,
+                d: scale,
+                tx: -crop.minX * scale,
+                ty: -crop.minY * scale
+            ),
+            at: .zero
+        )
         instruction.layerInstructions = [layerInstruction]
 
         let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = crop.size
+        videoComposition.renderSize = renderSize
         videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
         videoComposition.instructions = [instruction]
 
@@ -2306,6 +2411,17 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         exporter.videoComposition = videoComposition
         exporter.shouldOptimizeForNetworkUse = true
         try await exporter.export(to: outputURL, as: .mp4)
+    }
+
+    private func scaledRenderSize(for sourceSize: CGSize, maximumLongEdge: CGFloat?) -> CGSize {
+        guard let maximumLongEdge else { return sourceSize }
+        let sourceLongEdge = max(sourceSize.width, sourceSize.height)
+        guard sourceLongEdge > maximumLongEdge else { return sourceSize }
+
+        let scale = maximumLongEdge / sourceLongEdge
+        let width = max(80, Int((sourceSize.width * scale).rounded(.down)))
+        let height = max(80, Int((sourceSize.height * scale).rounded(.down)))
+        return CGSize(width: width - width % 2, height: height - height % 2)
     }
 
     private func saveMixedPlaybackAndSplitTrackVersions(from temporaryURL: URL, to finalURL: URL) async throws -> URL {
@@ -2420,6 +2536,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         finalOutputURL = nil
         temporaryOutputURL = nil
         postCropRect = nil
+        outputResolution = .native
         expectedAudioTrackCount = 0
         videoSampleCount = 0
         audioSampleCount = 0
