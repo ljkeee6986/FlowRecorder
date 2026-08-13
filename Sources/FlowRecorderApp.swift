@@ -2042,8 +2042,9 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 stopCaptureError = error
             }
 
-            let actualAudioTrackCount = currentExpectedWrittenAudioTrackCount()
-            let audioWarning = missingAudioWarning()
+            let audioSummary = currentAudioCaptureSummary()
+            let actualAudioTrackCount = audioSummary.trackCount
+            let audioWarning = audioSummary.warning
             try await finishWriter(writer)
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: actualAudioTrackCount)
 
@@ -2215,29 +2216,29 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         }
     }
 
-    private func currentExpectedWrittenAudioTrackCount() -> Int {
+    private func currentAudioCaptureSummary() -> (trackCount: Int, warning: String) {
         queue.sync {
-            (audioSampleCount > 0 ? 1 : 0) + (microphoneSampleCount > 0 ? 1 : 0)
+            let hasSystemAudio = audioSampleCount > 0
+            let hasMicrophone = microphoneSampleCount > 0
+            let missingSystemAudio = requestedSystemAudio && !hasSystemAudio
+            let missingMicrophone = requestedMicrophone && !hasMicrophone
+            let warning: String
+            switch (missingSystemAudio, missingMicrophone) {
+            case (true, true):
+                warning = "；但没有收到系统声音或麦克风输入"
+            case (true, false):
+                warning = "；但没有收到系统声音"
+            case (false, true):
+                warning = "；但没有收到麦克风输入"
+            case (false, false):
+                warning = ""
+            }
+            return ((hasSystemAudio ? 1 : 0) + (hasMicrophone ? 1 : 0), warning)
         }
     }
 
     private func writerDiagnostics() -> String {
         "样本统计：画面 \(videoSampleCount)，系统声 \(audioSampleCount)，麦克风 \(microphoneSampleCount)"
-    }
-
-    private func missingAudioWarning() -> String {
-        let missingSystemAudio = requestedSystemAudio && audioSampleCount == 0
-        let missingMicrophone = requestedMicrophone && microphoneSampleCount == 0
-        switch (missingSystemAudio, missingMicrophone) {
-        case (true, true):
-            return "；但没有收到系统声音或麦克风输入"
-        case (true, false):
-            return "；但没有收到系统声音"
-        case (false, true):
-            return "；但没有收到麦克风输入"
-        case (false, false):
-            return ""
-        }
     }
 
     private func makeCaptureSetup(
@@ -2429,11 +2430,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             ) else {
                 throw RecorderError.saveFailed("裁剪音频轨初始化失败")
             }
-            try compositionAudioTrack.insertTimeRange(
-                CMTimeRange(start: .zero, duration: duration),
-                of: audioTrack,
-                at: .zero
-            )
+            try await insertAvailableAudioRange(from: audioTrack, into: compositionAudioTrack, videoDuration: duration)
         }
 
         let instruction = AVMutableVideoCompositionInstruction()
@@ -2486,7 +2483,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         try? FileManager.default.removeItem(at: mixedURL)
 
         do {
-            let actualAudioTrackCount = currentExpectedWrittenAudioTrackCount()
+            let actualAudioTrackCount = currentAudioCaptureSummary().trackCount
             try FileManager.default.copyItem(at: temporaryURL, to: splitURL)
             try await validatePlayableMovie(at: splitURL, expectedAudioTracks: actualAudioTrackCount)
 
@@ -2497,6 +2494,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             return try commitTemporaryRecording(from: mixedURL, to: finalURL)
         } catch {
             try? FileManager.default.removeItem(at: mixedURL)
+            try? FileManager.default.removeItem(at: splitURL)
             throw error
         }
     }
@@ -2535,11 +2533,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 throw RecorderError.saveFailed("混音音频轨初始化失败")
             }
 
-            try compositionAudioTrack.insertTimeRange(
-                CMTimeRange(start: .zero, duration: duration),
-                of: audioTrack,
-                at: .zero
-            )
+            try await insertAvailableAudioRange(from: audioTrack, into: compositionAudioTrack, videoDuration: duration)
 
             let parameters = AVMutableAudioMixInputParameters(track: compositionAudioTrack)
             // Track 0 is usually ScreenCaptureKit system audio, track 1 is microphone.
@@ -2558,6 +2552,21 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         exporter.audioMix = audioMix
         exporter.shouldOptimizeForNetworkUse = true
         try await exporter.export(to: outputURL, as: .mp4)
+    }
+
+    private func insertAvailableAudioRange(
+        from sourceTrack: AVAssetTrack,
+        into destinationTrack: AVMutableCompositionTrack,
+        videoDuration: CMTime
+    ) async throws {
+        let sourceRange = try await sourceTrack.load(.timeRange)
+        let availableDuration = CMTimeMinimum(sourceRange.duration, videoDuration)
+        guard availableDuration.isValid, CMTimeCompare(availableDuration, .zero) > 0 else { return }
+        try destinationTrack.insertTimeRange(
+            CMTimeRange(start: sourceRange.start, duration: availableDuration),
+            of: sourceTrack,
+            at: sourceRange.start
+        )
     }
 
     private func commitTemporaryRecording(from temporaryURL: URL, to finalURL: URL) throws -> URL {
