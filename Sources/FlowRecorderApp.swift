@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import CoreImage
 import ScreenCaptureKit
 import SwiftUI
 
@@ -122,6 +123,7 @@ final class AppModel: ObservableObject {
     @Published var recentRecordings: [RecordingItem] = []
     @Published var includeSystemAudio = true
     @Published var includeMicrophone = false
+    @Published var highlightMouseClicks = true
     @Published var outputResolution = OutputResolutionPreset.native
     @Published var microphoneDevices: [MicrophoneDevice] = []
     @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID
@@ -208,7 +210,8 @@ final class AppModel: ObservableObject {
                 includeMicrophone: includeMicrophone,
                 microphoneDeviceID: microphoneDeviceID,
                 captureTarget: captureTarget,
-                outputResolution: outputResolution
+                outputResolution: outputResolution,
+                highlightMouseClicks: highlightMouseClicks
             )
             outputURL = nil
             isRecording = true
@@ -256,7 +259,13 @@ final class AppModel: ObservableObject {
             isBusy = false
             endRecordingTimer()
             OverlayManager.shared.hideRecordingControls()
-            status = "已保存：\(result.url.lastPathComponent)"
+            if result.renderedClickCount > 0 {
+                status = "已保存：\(result.url.lastPathComponent)（已叠加 \(result.renderedClickCount) 次点击）"
+            } else if result.clickOverlayFailed {
+                status = "已保存：\(result.url.lastPathComponent)（点击提示未叠加，已保留原始视频）"
+            } else {
+                status = "已保存：\(result.url.lastPathComponent)"
+            }
             refreshRecordings()
         } catch {
             isRecording = false
@@ -956,6 +965,9 @@ struct MainView: View {
                         .disabled(model.isRecording || model.isBusy)
                     Divider().opacity(0.42).padding(.leading, 46)
                     sourceToggleCard(title: "麦克风", subtitle: model.includeMicrophone ? "人声讲解" : "关闭", icon: "mic.fill", tint: Color(red: 0.96, green: 0.45, blue: 0.55), isOn: Binding(get: { model.includeMicrophone }, set: { model.setMicrophoneEnabled($0) }))
+                        .disabled(model.isRecording || model.isBusy)
+                    Divider().opacity(0.42).padding(.leading, 46)
+                    sourceToggleCard(title: "鼠标点击", subtitle: model.highlightMouseClicks ? "视频内显示点击光圈" : "关闭", icon: "cursorarrow.rays", tint: freshMint, isOn: $model.highlightMouseClicks)
                         .disabled(model.isRecording || model.isBusy)
                 }
                 if model.includeMicrophone {
@@ -1993,6 +2005,26 @@ enum RecorderError: LocalizedError {
 
 struct RecordingStopResult {
     let url: URL
+    let capturedClickCount: Int
+    let renderedClickCount: Int
+    let clickOverlayFailed: Bool
+}
+
+private enum MouseClickButton {
+    case left
+    case right
+}
+
+private struct MouseClickMarker {
+    let timestamp: TimeInterval
+    let location: CGPoint
+    let button: MouseClickButton
+}
+
+private struct RenderedMouseClickMarker {
+    let timestamp: TimeInterval
+    let point: CGPoint
+    let button: MouseClickButton
 }
 
 final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
@@ -2001,7 +2033,11 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     private var finalOutputURL: URL?
     private var temporaryOutputURL: URL?
     private var postCropRect: CGRect?
+    private var captureDisplayFrame: CGRect?
     private var outputResolution = OutputResolutionPreset.native
+    private var shouldHighlightMouseClicks = false
+    private var mouseClickMonitors: [Any] = []
+    private var clickMarkers: [MouseClickMarker] = []
     private var recordingStartContinuation: CheckedContinuation<Void, Error>?
     private var recordingFinishContinuation: CheckedContinuation<Void, Error>?
     private var recordingOutputError: Error?
@@ -2018,7 +2054,8 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         includeMicrophone: Bool,
         microphoneDeviceID: String?,
         captureTarget: RecorderCaptureTarget,
-        outputResolution: OutputResolutionPreset
+        outputResolution: OutputResolutionPreset,
+        highlightMouseClicks: Bool
     ) async throws -> URL {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
@@ -2061,7 +2098,10 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         self.finalOutputURL = destination.finalURL
         self.temporaryOutputURL = destination.temporaryURL
         self.postCropRect = captureSetup.postCropRect
+        self.captureDisplayFrame = captureSetup.displayFrame
         self.outputResolution = outputResolution
+        self.shouldHighlightMouseClicks = highlightMouseClicks
+        self.clickMarkers = []
         self.recordingOutputError = nil
         self.recordingDidStart = false
         self.recordingDidFinish = false
@@ -2071,6 +2111,9 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             try await waitForRecordingStart(timeout: 4)
             return destination.finalURL
         } catch {
+            await MainActor.run {
+                self.stopMouseClickMonitoring()
+            }
             try? await stream.stopCapture()
             try? FileManager.default.removeItem(at: destination.temporaryURL)
             resetAfterStop()
@@ -2083,24 +2126,50 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             throw RecorderError.writerNotReady
         }
 
+        let capturedClickMarkers = await stopMouseClickCaptureAndSnapshot()
+        let requiresProcessing = postCropRect != nil || outputResolution.maximumLongEdge != nil
+        var renderedClickCount = 0
+        var clickOverlayFailed = false
         var filesToQuarantine = [temporaryOutputURL]
         do {
             try await finishNativeRecording(stream)
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: 0)
 
             var workingURL = temporaryOutputURL
-            if postCropRect != nil || outputResolution.maximumLongEdge != nil {
+            if requiresProcessing || !capturedClickMarkers.isEmpty {
                 let processedURL = temporaryOutputURL.deletingLastPathComponent()
                     .appendingPathComponent("\(temporaryOutputURL.deletingPathExtension().lastPathComponent)-processed.mp4")
                 filesToQuarantine.append(processedURL)
-                try await exportProcessedMovie(
-                    from: temporaryOutputURL,
-                    to: processedURL,
-                    cropRect: postCropRect,
-                    maximumLongEdge: outputResolution.maximumLongEdge
-                )
-                try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
-                workingURL = processedURL
+                do {
+                    renderedClickCount = try await exportProcessedMovie(
+                        from: temporaryOutputURL,
+                        to: processedURL,
+                        cropRect: postCropRect,
+                        maximumLongEdge: outputResolution.maximumLongEdge,
+                        clickMarkers: capturedClickMarkers
+                    )
+                } catch {
+                    guard !capturedClickMarkers.isEmpty else { throw error }
+                    clickOverlayFailed = true
+                    try? FileManager.default.removeItem(at: processedURL)
+                    if requiresProcessing {
+                        renderedClickCount = try await exportProcessedMovie(
+                            from: temporaryOutputURL,
+                            to: processedURL,
+                            cropRect: postCropRect,
+                            maximumLongEdge: outputResolution.maximumLongEdge,
+                            clickMarkers: []
+                        )
+                    } else {
+                        renderedClickCount = 0
+                        workingURL = temporaryOutputURL
+                        try? FileManager.default.removeItem(at: processedURL)
+                    }
+                }
+                if FileManager.default.fileExists(atPath: processedURL.path) {
+                    try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
+                    workingURL = processedURL
+                }
             }
 
             let savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
@@ -2108,8 +2177,16 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 try? FileManager.default.removeItem(at: url)
             }
             resetAfterStop()
-            return RecordingStopResult(url: savedURL)
+            return RecordingStopResult(
+                url: savedURL,
+                capturedClickCount: capturedClickMarkers.count,
+                renderedClickCount: renderedClickCount,
+                clickOverlayFailed: clickOverlayFailed
+            )
         } catch {
+            await MainActor.run {
+                self.stopMouseClickMonitoring()
+            }
             var moved: URL?
             for url in filesToQuarantine {
                 moved = quarantineBrokenFile(url) ?? moved
@@ -2122,6 +2199,15 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
         queue.async {
             self.recordingDidStart = true
+            let startedAt = ProcessInfo.processInfo.systemUptime
+            if self.shouldHighlightMouseClicks, let displayFrame = self.captureDisplayFrame {
+                Task { @MainActor [weak self] in
+                    self?.startMouseClickMonitoring(
+                        recordingStartTimestamp: startedAt,
+                        displayFrame: displayFrame
+                    )
+                }
+            }
             guard let continuation = self.recordingStartContinuation else { return }
             self.recordingStartContinuation = nil
             continuation.resume()
@@ -2164,6 +2250,86 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         }
     }
 
+    @MainActor
+    private func startMouseClickMonitoring(recordingStartTimestamp: TimeInterval, displayFrame: CGRect) {
+        stopMouseClickMonitoring()
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown]
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            self?.captureMouseClick(
+                eventType: event.type,
+                eventTimestamp: event.timestamp,
+                screenLocation: NSEvent.mouseLocation,
+                recordingStartTimestamp: recordingStartTimestamp,
+                displayFrame: displayFrame
+            )
+        }) {
+            mouseClickMonitors.append(globalMonitor)
+        }
+
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            if event.window?.sharingType != NSWindow.SharingType.none {
+                self?.captureMouseClick(
+                    eventType: event.type,
+                    eventTimestamp: event.timestamp,
+                    screenLocation: NSEvent.mouseLocation,
+                    recordingStartTimestamp: recordingStartTimestamp,
+                    displayFrame: displayFrame
+                )
+            }
+            return event
+        }) {
+            mouseClickMonitors.append(localMonitor)
+        }
+    }
+
+    @MainActor
+    private func stopMouseClickMonitoring() {
+        for monitor in mouseClickMonitors {
+            NSEvent.removeMonitor(monitor)
+        }
+        mouseClickMonitors.removeAll()
+    }
+
+    private func stopMouseClickCaptureAndSnapshot() async -> [MouseClickMarker] {
+        await MainActor.run {
+            self.stopMouseClickMonitoring()
+        }
+        return queue.sync {
+            self.clickMarkers.sorted { $0.timestamp < $1.timestamp }
+        }
+    }
+
+    private func captureMouseClick(
+        eventType: NSEvent.EventType,
+        eventTimestamp: TimeInterval,
+        screenLocation: CGPoint,
+        recordingStartTimestamp: TimeInterval,
+        displayFrame: CGRect
+    ) {
+        guard displayFrame.contains(screenLocation) else { return }
+        let elapsed = eventTimestamp - recordingStartTimestamp
+        guard elapsed >= 0 else { return }
+
+        let marker = MouseClickMarker(
+            timestamp: elapsed,
+            location: CGPoint(
+                x: screenLocation.x - displayFrame.minX,
+                y: screenLocation.y - displayFrame.minY
+            ),
+            button: eventType == .rightMouseDown ? .right : .left
+        )
+
+        queue.async {
+            if let last = self.clickMarkers.last,
+               marker.timestamp - last.timestamp < 0.03,
+               hypot(marker.location.x - last.location.x, marker.location.y - last.location.y) < 3 {
+                return
+            }
+            self.clickMarkers.append(marker)
+        }
+    }
+
     private func makeOutputDestination() -> (finalURL: URL, temporaryURL: URL) {
         let folder = recordingsFolderURL()
         let tempFolder = inProgressFolderURL()
@@ -2190,7 +2356,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     private func makeCaptureSetup(
         target: RecorderCaptureTarget,
         content: SCShareableContent
-    ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int, postCropRect: CGRect?) {
+    ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int, postCropRect: CGRect?, displayFrame: CGRect) {
         switch target {
         case .display(let captureRect):
             guard let display = displayForCaptureRect(captureRect, displays: content.displays) else {
@@ -2205,7 +2371,8 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 sourceRect: nil,
                 width: fullSize.width,
                 height: fullSize.height,
-                postCropRect: postCropRect
+                postCropRect: postCropRect,
+                displayFrame: displayFrame
             )
 
         case .window(let windowID, let fallbackFrame):
@@ -2231,7 +2398,8 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 sourceRect: nil,
                 width: fullSize.width,
                 height: fullSize.height,
-                postCropRect: sourceRect
+                postCropRect: sourceRect,
+                displayFrame: displayFrame
             )
         }
     }
@@ -2354,8 +2522,9 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         from sourceURL: URL,
         to outputURL: URL,
         cropRect: CGRect?,
-        maximumLongEdge: CGFloat?
-    ) async throws {
+        maximumLongEdge: CGFloat?,
+        clickMarkers: [MouseClickMarker]
+    ) async throws -> Int {
         try? FileManager.default.removeItem(at: outputURL)
 
         let asset = AVURLAsset(url: sourceURL)
@@ -2403,26 +2572,44 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             try await insertAvailableAudioRange(from: audioTrack, into: compositionAudioTrack, videoDuration: duration)
         }
 
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
-        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
-        layerInstruction.setTransform(
-            CGAffineTransform(
-                a: scale,
-                b: 0,
-                c: 0,
-                d: scale,
-                tx: -crop.minX * scale,
-                ty: -crop.minY * scale
-            ),
-            at: .zero
+        let mappedClickMarkers = mappedClickMarkers(
+            from: clickMarkers,
+            crop: crop,
+            scale: scale,
+            renderSize: renderSize,
+            duration: duration
         )
-        instruction.layerInstructions = [layerInstruction]
+        let videoComposition: AVMutableVideoComposition
+        if mappedClickMarkers.isEmpty {
+            let instruction = AVMutableVideoCompositionInstruction()
+            instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+            let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: compositionVideoTrack)
+            layerInstruction.setTransform(
+                CGAffineTransform(
+                    a: scale,
+                    b: 0,
+                    c: 0,
+                    d: scale,
+                    tx: -crop.minX * scale,
+                    ty: -crop.minY * scale
+                ),
+                at: .zero
+            )
+            instruction.layerInstructions = [layerInstruction]
 
-        let videoComposition = AVMutableVideoComposition()
-        videoComposition.renderSize = renderSize
-        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
-        videoComposition.instructions = [instruction]
+            videoComposition = AVMutableVideoComposition()
+            videoComposition.renderSize = renderSize
+            videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+            videoComposition.instructions = [instruction]
+        } else {
+            videoComposition = makeClickOverlayVideoComposition(
+                asset: composition,
+                renderSize: renderSize,
+                crop: crop,
+                scale: scale,
+                clickMarkers: mappedClickMarkers
+            )
+        }
 
         guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
             throw RecorderError.saveFailed("裁剪导出器初始化失败")
@@ -2431,6 +2618,163 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         exporter.videoComposition = videoComposition
         exporter.shouldOptimizeForNetworkUse = true
         try await exporter.export(to: outputURL, as: .mp4)
+        return mappedClickMarkers.count
+    }
+
+    private func mappedClickMarkers(
+        from clickMarkers: [MouseClickMarker],
+        crop: CGRect,
+        scale: CGFloat,
+        renderSize: CGSize,
+        duration: CMTime
+    ) -> [RenderedMouseClickMarker] {
+        guard !clickMarkers.isEmpty, duration.seconds.isFinite, duration.seconds > 0 else { return [] }
+        let renderRect = CGRect(origin: .zero, size: renderSize)
+
+        return clickMarkers.compactMap { marker in
+            guard marker.timestamp <= duration.seconds else { return nil }
+            let point = CGPoint(
+                x: (marker.location.x - crop.minX) * scale,
+                y: (marker.location.y - crop.minY) * scale
+            )
+            guard renderRect.contains(point) else { return nil }
+            return RenderedMouseClickMarker(
+                timestamp: max(0, marker.timestamp),
+                point: point,
+                button: marker.button
+            )
+        }
+    }
+
+    private func makeClickOverlayVideoComposition(
+        asset: AVAsset,
+        renderSize: CGSize,
+        crop: CGRect,
+        scale: CGFloat,
+        clickMarkers: [RenderedMouseClickMarker]
+    ) -> AVMutableVideoComposition {
+        let renderRect = CGRect(origin: .zero, size: renderSize)
+        let baseRadius = max(18, min(34, max(renderSize.width, renderSize.height) * 0.018))
+
+        let videoComposition = AVMutableVideoComposition(asset: asset) { request in
+            let transformedFrame = request.sourceImage
+                .cropped(to: crop)
+                .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
+                .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .cropped(to: renderRect)
+
+            let time = request.compositionTime.seconds
+            let image = Self.drawMouseClicks(
+                clickMarkers,
+                at: time,
+                over: transformedFrame,
+                renderRect: renderRect,
+                baseRadius: baseRadius
+            )
+            request.finish(with: image.cropped(to: renderRect), context: nil)
+        }
+
+        videoComposition.renderSize = renderSize
+        videoComposition.frameDuration = CMTime(value: 1, timescale: 30)
+        return videoComposition
+    }
+
+    private static func drawMouseClicks(
+        _ markers: [RenderedMouseClickMarker],
+        at time: TimeInterval,
+        over frame: CIImage,
+        renderRect: CGRect,
+        baseRadius: CGFloat
+    ) -> CIImage {
+        var image = frame
+        for marker in markers {
+            let age = time - marker.timestamp
+            guard age >= 0, age <= 0.58 else { continue }
+            image = drawMouseClick(
+                marker,
+                age: age,
+                over: image,
+                renderRect: renderRect,
+                baseRadius: baseRadius
+            )
+        }
+        return image
+    }
+
+    private static func drawMouseClick(
+        _ marker: RenderedMouseClickMarker,
+        age: TimeInterval,
+        over frame: CIImage,
+        renderRect: CGRect,
+        baseRadius: CGFloat
+    ) -> CIImage {
+        let progress = CGFloat(min(max(age / 0.58, 0), 1))
+        let accent: CIColor
+        switch marker.button {
+        case .left:
+            accent = CIColor(red: 0.10, green: 0.54, blue: 1.0, alpha: 1.0)
+        case .right:
+            accent = CIColor(red: 1.0, green: 0.58, blue: 0.08, alpha: 1.0)
+        }
+
+        let pulseRadius = baseRadius * (1.25 + progress * 2.4)
+        let pulseAlpha = 0.70 * (1.0 - progress)
+        let pulse = radialClickImage(
+            center: marker.point,
+            radius: pulseRadius,
+            innerAlpha: pulseAlpha,
+            outerAlpha: 0,
+            accent: accent,
+            renderRect: renderRect
+        )
+
+        var image = pulse.composited(over: frame)
+        if progress < 0.42 {
+            let coreProgress = progress / 0.42
+            let coreRadius = baseRadius * (0.52 + coreProgress * 0.40)
+            let coreAlpha = 0.78 * (1.0 - coreProgress)
+            let core = radialClickImage(
+                center: marker.point,
+                radius: coreRadius,
+                innerAlpha: coreAlpha,
+                outerAlpha: 0,
+                accent: accent,
+                renderRect: renderRect
+            )
+            image = core.composited(over: image)
+        }
+        return image
+    }
+
+    private static func radialClickImage(
+        center: CGPoint,
+        radius: CGFloat,
+        innerAlpha: CGFloat,
+        outerAlpha: CGFloat,
+        accent: CIColor,
+        renderRect: CGRect
+    ) -> CIImage {
+        let filter = CIFilter(
+            name: "CIRadialGradient",
+            parameters: [
+                "inputCenter": CIVector(x: center.x, y: center.y),
+                "inputRadius0": max(1, radius * 0.20),
+                "inputRadius1": max(2, radius),
+                "inputColor0": CIColor(
+                    red: accent.red,
+                    green: accent.green,
+                    blue: accent.blue,
+                    alpha: innerAlpha
+                ),
+                "inputColor1": CIColor(
+                    red: accent.red,
+                    green: accent.green,
+                    blue: accent.blue,
+                    alpha: outerAlpha
+                )
+            ]
+        )
+        return (filter?.outputImage ?? CIImage.empty()).cropped(to: renderRect)
     }
 
     private func scaledRenderSize(for sourceSize: CGSize, maximumLongEdge: CGFloat?) -> CGSize {
@@ -2484,7 +2828,10 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         finalOutputURL = nil
         temporaryOutputURL = nil
         postCropRect = nil
+        captureDisplayFrame = nil
         outputResolution = .native
+        shouldHighlightMouseClicks = false
+        clickMarkers = []
         recordingStartContinuation = nil
         recordingFinishContinuation = nil
         recordingOutputError = nil
