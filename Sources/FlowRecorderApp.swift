@@ -46,6 +46,31 @@ private func rotateStatusLogIfNeeded(at file: URL) {
     }
 }
 
+private enum AppBuildInfo {
+    static var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    static var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+    }
+
+    static var displayLabel: String {
+        "测试版 v\(version) (\(build))"
+    }
+
+    static var diagnosticsLines: [String] {
+        [
+            "App Version: \(displayLabel)",
+            "Bundle Identifier: \(Bundle.main.bundleIdentifier ?? "unknown")",
+            "Minimum macOS: \(Bundle.main.object(forInfoDictionaryKey: "LSMinimumSystemVersion") as? String ?? "unknown")",
+            "Current macOS: \(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "App Bundle Path: \(Bundle.main.bundleURL.path)",
+            "Executable Path: \(Bundle.main.executableURL?.path ?? "unknown")"
+        ]
+    }
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -703,7 +728,10 @@ final class AppModel: ObservableObject {
 
         var lines = [
             "FlowRecorder Diagnostic",
-            "Generated: \(Date())",
+            "Generated: \(Date())"
+        ]
+        lines.append(contentsOf: AppBuildInfo.diagnosticsLines)
+        lines.append(contentsOf: [
             "Status: \(status)",
             "Recording State: isRecording=\(isRecording), isBusy=\(isBusy), isCountingDown=\(isCountingDown)",
             "Sources: systemAudio=\(includeSystemAudio), microphone=\(includeMicrophone), clickHighlights=\(highlightMouseClicks)",
@@ -715,7 +743,7 @@ final class AppModel: ObservableObject {
             "Free Disk Space: \(freeDiskSpaceDescription())",
             "",
             "Recent Recordings:"
-        ]
+        ])
 
         if recentRecordings.isEmpty {
             lines.append("- none")
@@ -1919,6 +1947,12 @@ struct MainView: View {
                 .font(.system(size: 13, weight: .semibold))
             Text("免费工具 · 禁止商用 · 侵权必究")
                 .font(.system(size: 13, weight: .bold, design: .rounded))
+            Divider()
+                .frame(height: 13)
+                .overlay(Color.black.opacity(0.16))
+            Text(AppBuildInfo.displayLabel)
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .foregroundStyle(Color(red: 0.18, green: 0.47, blue: 0.78))
         }
         .foregroundStyle(Color(red: 0.42, green: 0.43, blue: 0.48))
         .padding(.horizontal, 12)
