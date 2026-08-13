@@ -4,6 +4,48 @@ import CoreImage
 @preconcurrency import ScreenCaptureKit
 import SwiftUI
 
+private let statusLogMaximumBytes: UInt64 = 2 * 1_024 * 1_024
+private let statusLogRetainedBytes: UInt64 = 512 * 1_024
+
+private func appendStatusLogLine(_ text: String, to file: URL) {
+    rotateStatusLogIfNeeded(at: file)
+    if let handle = try? FileHandle(forWritingTo: file) {
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data(text.utf8))
+    } else {
+        try? text.write(to: file, atomically: true, encoding: .utf8)
+    }
+}
+
+private func rotateStatusLogIfNeeded(at file: URL) {
+    guard let values = try? file.resourceValues(forKeys: [.fileSizeKey]),
+          let fileSize = values.fileSize,
+          UInt64(fileSize) > statusLogMaximumBytes,
+          let handle = try? FileHandle(forReadingFrom: file) else {
+        return
+    }
+    defer { try? handle.close() }
+
+    do {
+        let size = try handle.seekToEnd()
+        let startOffset = size > statusLogRetainedBytes ? size - statusLogRetainedBytes : 0
+        try handle.seek(toOffset: startOffset)
+        let data = try handle.readToEnd() ?? Data()
+        var retainedText = String(decoding: data, as: UTF8.self)
+        if startOffset > 0, let firstNewline = retainedText.firstIndex(of: "\n") {
+            retainedText = String(retainedText[retainedText.index(after: firstNewline)...])
+        }
+
+        let maxSize = ByteCountFormatter.string(fromByteCount: Int64(statusLogMaximumBytes), countStyle: .file)
+        let keptSize = ByteCountFormatter.string(fromByteCount: Int64(statusLogRetainedBytes), countStyle: .file)
+        let marker = "[\(Date())] 调试：status.txt exceeded \(maxSize), kept recent \(keptSize)\n"
+        try "\(marker)\(retainedText)".write(to: file, atomically: true, encoding: .utf8)
+    } catch {
+        // Logging should never interrupt recording or saving.
+    }
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -985,13 +1027,7 @@ final class AppModel: ObservableObject {
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let file = folder.appendingPathComponent("status.txt")
         let text = "[\(Date())] \(value)\n"
-        if let handle = try? FileHandle(forWritingTo: file) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data(text.utf8))
-        } else {
-            try? text.write(to: file, atomically: true, encoding: .utf8)
-        }
+        appendStatusLogLine(text, to: file)
     }
 }
 
@@ -3601,12 +3637,6 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     private func appendRecorderNote(_ message: String) {
         let file = recordingsFolderURL().appendingPathComponent("status.txt")
         let text = "[\(Date())] 调试：\(message)\n"
-        if let handle = try? FileHandle(forWritingTo: file) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: Data(text.utf8))
-        } else {
-            try? text.write(to: file, atomically: true, encoding: .utf8)
-        }
+        appendStatusLogLine(text, to: file)
     }
 }
