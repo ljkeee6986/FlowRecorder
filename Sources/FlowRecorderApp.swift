@@ -2656,6 +2656,9 @@ private struct RenderedMouseClickMarker: Sendable {
 }
 
 final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
+    private static let recordingStartTimeout: TimeInterval = 4
+    private static let nativeFinishTimeout: TimeInterval = 60
+
     private var stream: SCStream?
     private var recordingOutput: SCRecordingOutput?
     private var finalOutputURL: URL?
@@ -2741,7 +2744,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
 
         do {
             try await stream.startCapture()
-            try await waitForRecordingStart(timeout: 4)
+            try await waitForRecordingStart(timeout: Self.recordingStartTimeout)
             return destination.finalURL
         } catch {
             await MainActor.run {
@@ -3183,10 +3186,10 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                         }
                     }
                 }
-                self.queue.asyncAfter(deadline: .now() + 12) {
+                self.queue.asyncAfter(deadline: .now() + Self.nativeFinishTimeout) {
                     guard let continuation = self.recordingFinishContinuation else { return }
                     self.recordingFinishContinuation = nil
-                    continuation.resume(throwing: RecorderError.saveFailed("原生录制器没有完成文件封装"))
+                    continuation.resume(throwing: RecorderError.saveFailed("原生录制器超过 \(Int(Self.nativeFinishTimeout)) 秒仍未完成文件封装"))
                 }
             }
         }
