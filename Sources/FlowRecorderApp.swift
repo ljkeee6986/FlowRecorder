@@ -249,12 +249,7 @@ final class AppModel: ObservableObject {
             outputURL = result.url
             isRecording = false
             isBusy = false
-            if result.hasSeparateAudioTracks {
-                let splitName = recorder.splitTrackSiblingURL(for: result.url).lastPathComponent
-                status = "已保存：\(result.url.lastPathComponent)（直接播放版）；已同时生成：\(splitName)（分轨版）"
-            } else {
-                status = "已保存：\(result.url.lastPathComponent)\(result.audioWarning)"
-            }
+            status = "已保存：\(result.url.lastPathComponent)"
             refreshRecordings()
         } catch {
             isRecording = false
@@ -451,7 +446,6 @@ final class AppModel: ObservableObject {
         recentRecordings = urls
             .filter {
                 $0.pathExtension.lowercased() == "mp4"
-                && !$0.deletingPathExtension().lastPathComponent.hasSuffix("_分轨版")
             }
             .compactMap { RecordingItem(url: $0) }
             .sorted { $0.modifiedAt > $1.modifiedAt }
@@ -938,7 +932,7 @@ struct MainView: View {
                     microphonePicker
                 }
                 captureAreaControl
-                Text(model.includeMicrophone ? "系统声和麦克风都正常写入时，会同时保留分轨版，方便后期分开调声音。" : "只录系统声时，文件更轻。需要讲解人声时再打开麦克风。")
+                Text(model.includeMicrophone ? "系统声音和麦克风会一并写入同一个 MP4，适合直接播放和分享。" : "只录系统声时，文件更轻。需要讲解人声时再打开麦克风。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1878,32 +1872,24 @@ enum RecorderError: LocalizedError {
 
 struct RecordingStopResult {
     let url: URL
-    let hasSeparateAudioTracks: Bool
-    let audioWarning: String
 }
 
-final class ScreenRecorder: NSObject, SCStreamOutput {
+final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     private var stream: SCStream?
-    private var writer: AVAssetWriter?
-    private var videoInput: AVAssetWriterInput?
-    private var audioInput: AVAssetWriterInput?
-    private var microphoneInput: AVAssetWriterInput?
-    private var startTime: CMTime?
+    private var recordingOutput: SCRecordingOutput?
     private var finalOutputURL: URL?
     private var temporaryOutputURL: URL?
     private var postCropRect: CGRect?
     private var outputResolution = OutputResolutionPreset.native
-    private var requestedSystemAudio = false
-    private var requestedMicrophone = false
-    private var videoSampleCount = 0
-    private var audioSampleCount = 0
-    private var microphoneSampleCount = 0
-    private var firstVideoFrameContinuation: CheckedContinuation<Void, Error>?
-    private var isFinishing = false
+    private var recordingStartContinuation: CheckedContinuation<Void, Error>?
+    private var recordingFinishContinuation: CheckedContinuation<Void, Error>?
+    private var recordingOutputError: Error?
+    private var recordingDidStart = false
+    private var recordingDidFinish = false
     private let queue = DispatchQueue(label: "com.jackliu.flowrecorder.writer")
 
     var hasActiveRecording: Bool {
-        stream != nil || writer != nil
+        stream != nil || recordingOutput != nil
     }
 
     func start(
@@ -1916,8 +1902,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
 
         let destination = makeOutputDestination()
-        let writer = try AVAssetWriter(outputURL: destination.temporaryURL, fileType: .mp4)
-        writer.shouldOptimizeForNetworkUse = true
 
         let captureSetup = try makeCaptureSetup(
             target: captureTarget,
@@ -1925,52 +1909,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         )
         let width = captureSetup.width
         let height = captureSetup.height
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 12_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
-            ]
-        ]
-
-        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoInput.expectsMediaDataInRealTime = true
-        guard writer.canAdd(videoInput) else {
-            throw RecorderError.saveFailed("视频输入初始化失败")
-        }
-        writer.add(videoInput)
-
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 48_000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 256_000
-        ]
-
-        var audioInput: AVAssetWriterInput?
-        if includeSystemAudio {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            input.expectsMediaDataInRealTime = true
-            guard writer.canAdd(input) else {
-                throw RecorderError.saveFailed("系统声音输入初始化失败")
-            }
-            writer.add(input)
-            audioInput = input
-        }
-
-        var microphoneInput: AVAssetWriterInput?
-        if includeMicrophone {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-            input.expectsMediaDataInRealTime = true
-            guard writer.canAdd(input) else {
-                throw RecorderError.saveFailed("麦克风输入初始化失败")
-            }
-            writer.add(input)
-            microphoneInput = input
-        }
-
         let config = SCStreamConfiguration()
         config.width = width
         config.height = height
@@ -1990,34 +1928,26 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         config.channelCount = 2
 
         let stream = SCStream(filter: captureSetup.filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
-        if includeSystemAudio {
-            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        }
-        if includeMicrophone {
-            try stream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue)
-        }
+        let recordingConfiguration = SCRecordingOutputConfiguration()
+        recordingConfiguration.outputURL = destination.temporaryURL
+        recordingConfiguration.outputFileType = .mp4
+        recordingConfiguration.videoCodecType = .h264
+        let recordingOutput = SCRecordingOutput(configuration: recordingConfiguration, delegate: self)
+        try stream.addRecordingOutput(recordingOutput)
 
         self.stream = stream
-        self.writer = writer
-        self.videoInput = videoInput
-        self.audioInput = audioInput
-        self.microphoneInput = microphoneInput
+        self.recordingOutput = recordingOutput
         self.finalOutputURL = destination.finalURL
         self.temporaryOutputURL = destination.temporaryURL
         self.postCropRect = captureSetup.postCropRect
         self.outputResolution = outputResolution
-        self.requestedSystemAudio = includeSystemAudio
-        self.requestedMicrophone = includeMicrophone
-        self.videoSampleCount = 0
-        self.audioSampleCount = 0
-        self.microphoneSampleCount = 0
-        self.startTime = nil
-        self.isFinishing = false
+        self.recordingOutputError = nil
+        self.recordingDidStart = false
+        self.recordingDidFinish = false
 
         do {
             try await stream.startCapture()
-            try await waitForFirstVideoFrame(timeout: 4)
+            try await waitForRecordingStart(timeout: 4)
             return destination.finalURL
         } catch {
             try? await stream.stopCapture()
@@ -2028,24 +1958,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     }
 
     func stop() async throws -> RecordingStopResult {
-        guard let stream, let writer, let finalOutputURL, let temporaryOutputURL else {
+        guard let stream, let finalOutputURL, let temporaryOutputURL else {
             throw RecorderError.writerNotReady
         }
 
         var filesToQuarantine = [temporaryOutputURL]
         do {
-            var stopCaptureError: Error?
-            do {
-                try await stream.stopCapture()
-            } catch {
-                stopCaptureError = error
-            }
-
-            let audioSummary = currentAudioCaptureSummary()
-            let actualAudioTrackCount = audioSummary.trackCount
-            let audioWarning = audioSummary.warning
-            try await finishWriter(writer)
-            try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: actualAudioTrackCount)
+            try await finishNativeRecording(stream)
+            try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: 0)
 
             var workingURL = temporaryOutputURL
             if postCropRect != nil || outputResolution.maximumLongEdge != nil {
@@ -2058,30 +1978,17 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                     cropRect: postCropRect,
                     maximumLongEdge: outputResolution.maximumLongEdge
                 )
-                try await validatePlayableMovie(at: processedURL, expectedAudioTracks: actualAudioTrackCount)
+                try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
                 workingURL = processedURL
             }
 
-            let savedURL: URL
-            if actualAudioTrackCount > 1 {
-                savedURL = try await saveMixedPlaybackAndSplitTrackVersions(from: workingURL, to: finalOutputURL)
-            } else {
-                savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
-            }
+            let savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
             for url in filesToQuarantine where url != savedURL {
                 try? FileManager.default.removeItem(at: url)
             }
-            if let stopCaptureError {
-                appendRecorderNote("stopCapture 抛错但文件已成功封装：\(saveFailureText(from: stopCaptureError))")
-            }
             resetAfterStop()
-            return RecordingStopResult(
-                url: savedURL,
-                hasSeparateAudioTracks: actualAudioTrackCount > 1,
-                audioWarning: audioWarning
-            )
+            return RecordingStopResult(url: savedURL)
         } catch {
-            cancelWriterIfNeeded(writer)
             var moved: URL?
             for url in filesToQuarantine {
                 moved = quarantineBrokenFile(url) ?? moved
@@ -2091,42 +1998,35 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         }
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard sampleBuffer.isValid else { return }
-
-        guard !isFinishing, let writer = self.writer else { return }
-
-        if startTime == nil, type == .screen {
-            let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            startTime = time
-            writer.startWriting()
-            writer.startSession(atSourceTime: time)
+    func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
+        queue.async {
+            self.recordingDidStart = true
+            guard let continuation = self.recordingStartContinuation else { return }
+            self.recordingStartContinuation = nil
+            continuation.resume()
         }
+    }
 
-        guard startTime != nil, writer.status == .writing else { return }
+    func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
+        queue.async {
+            self.recordingDidFinish = true
+            guard let continuation = self.recordingFinishContinuation else { return }
+            self.recordingFinishContinuation = nil
+            continuation.resume()
+        }
+    }
 
-        switch type {
-        case .screen:
-            if let videoInput, videoInput.isReadyForMoreMediaData {
-                if videoInput.append(sampleBuffer) {
-                    videoSampleCount += 1
-                    resumeFirstVideoFrameWaiterIfNeeded()
-                }
+    func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
+        queue.async {
+            self.recordingOutputError = error
+            if let continuation = self.recordingStartContinuation {
+                self.recordingStartContinuation = nil
+                continuation.resume(throwing: RecorderError.saveFailed(error.localizedDescription))
             }
-        case .audio:
-            if let audioInput, audioInput.isReadyForMoreMediaData {
-                if audioInput.append(sampleBuffer) {
-                    audioSampleCount += 1
-                }
+            if let continuation = self.recordingFinishContinuation {
+                self.recordingFinishContinuation = nil
+                continuation.resume(throwing: RecorderError.saveFailed(error.localizedDescription))
             }
-        case .microphone:
-            if let microphoneInput, microphoneInput.isReadyForMoreMediaData {
-                if microphoneInput.append(sampleBuffer) {
-                    microphoneSampleCount += 1
-                }
-            }
-        @unknown default:
-            break
         }
     }
 
@@ -2164,80 +2064,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         let temporaryURL = tempFolder.appendingPathComponent(tempName)
         try? FileManager.default.removeItem(at: temporaryURL)
         return (finalURL, temporaryURL)
-    }
-
-    private func finishWriter(_ writer: AVAssetWriter) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            queue.async {
-                self.isFinishing = true
-
-                guard self.videoSampleCount > 0 else {
-                    writer.cancelWriting()
-                    continuation.resume(throwing: RecorderError.saveFailed("没有收到屏幕画面，录制没有真正开始。\(self.writerDiagnostics())"))
-                    return
-                }
-
-                if writer.status == .failed {
-                    let message = writer.error?.localizedDescription ?? "写入器已经进入失败状态"
-                    continuation.resume(throwing: RecorderError.saveFailed(message))
-                    return
-                }
-
-                if writer.status == .unknown {
-                    writer.cancelWriting()
-                    continuation.resume(throwing: RecorderError.saveFailed("没有收到有效画面，录制时间可能太短。\(self.writerDiagnostics())"))
-                    return
-                }
-
-                guard writer.status == .writing else {
-                    if writer.status == .completed {
-                        continuation.resume()
-                    } else {
-                        continuation.resume(throwing: RecorderError.saveFailed("写入器状态异常：\(writer.status.rawValue)。\(self.writerDiagnostics())"))
-                    }
-                    return
-                }
-
-                self.videoInput?.markAsFinished()
-                self.audioInput?.markAsFinished()
-                self.microphoneInput?.markAsFinished()
-
-                writer.finishWriting {
-                    if writer.status == .completed {
-                        continuation.resume()
-                        return
-                    }
-
-                    let message = writer.error?.localizedDescription ?? "文件没有完成封装"
-                    continuation.resume(throwing: RecorderError.saveFailed("\(message)。\(self.writerDiagnostics())"))
-                }
-            }
-        }
-    }
-
-    private func currentAudioCaptureSummary() -> (trackCount: Int, warning: String) {
-        queue.sync {
-            let hasSystemAudio = audioSampleCount > 0
-            let hasMicrophone = microphoneSampleCount > 0
-            let missingSystemAudio = requestedSystemAudio && !hasSystemAudio
-            let missingMicrophone = requestedMicrophone && !hasMicrophone
-            let warning: String
-            switch (missingSystemAudio, missingMicrophone) {
-            case (true, true):
-                warning = "；但没有收到系统声音或麦克风输入"
-            case (true, false):
-                warning = "；但没有收到系统声音"
-            case (false, true):
-                warning = "；但没有收到麦克风输入"
-            case (false, false):
-                warning = ""
-            }
-            return ((hasSystemAudio ? 1 : 0) + (hasMicrophone ? 1 : 0), warning)
-        }
-    }
-
-    private func writerDiagnostics() -> String {
-        "样本统计：画面 \(videoSampleCount)，系统声 \(audioSampleCount)，麦克风 \(microphoneSampleCount)"
     }
 
     private func makeCaptureSetup(
@@ -2350,33 +2176,57 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         }
     }
 
-    private func waitForFirstVideoFrame(timeout: TimeInterval) async throws {
+    private func waitForRecordingStart(timeout: TimeInterval) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             queue.async {
-                if self.videoSampleCount > 0 {
+                if let recordingOutputError = self.recordingOutputError {
+                    continuation.resume(throwing: RecorderError.saveFailed(recordingOutputError.localizedDescription))
+                    return
+                }
+                if self.recordingDidStart {
                     continuation.resume()
                     return
                 }
-
-                self.firstVideoFrameContinuation = continuation
+                self.recordingStartContinuation = continuation
                 self.queue.asyncAfter(deadline: .now() + timeout) {
-                    guard let continuation = self.firstVideoFrameContinuation else { return }
-                    self.firstVideoFrameContinuation = nil
-                    continuation.resume(throwing: RecorderError.saveFailed("启动后没有收到屏幕画面，请重新开始录制"))
+                    guard let continuation = self.recordingStartContinuation else { return }
+                    self.recordingStartContinuation = nil
+                    continuation.resume(throwing: RecorderError.saveFailed("原生录制器没有启动，请重新开始录制"))
                 }
             }
         }
     }
 
-    private func resumeFirstVideoFrameWaiterIfNeeded() {
-        guard let continuation = firstVideoFrameContinuation else { return }
-        firstVideoFrameContinuation = nil
-        continuation.resume()
-    }
-
-    func splitTrackSiblingURL(for url: URL) -> URL {
-        let baseName = url.deletingPathExtension().lastPathComponent
-        return url.deletingLastPathComponent().appendingPathComponent("\(baseName)_分轨版.mp4")
+    private func finishNativeRecording(_ stream: SCStream) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                if let recordingOutputError = self.recordingOutputError {
+                    continuation.resume(throwing: RecorderError.saveFailed(recordingOutputError.localizedDescription))
+                    return
+                }
+                if self.recordingDidFinish {
+                    continuation.resume()
+                    return
+                }
+                self.recordingFinishContinuation = continuation
+                Task {
+                    do {
+                        try await stream.stopCapture()
+                    } catch {
+                        self.queue.async {
+                            guard let continuation = self.recordingFinishContinuation else { return }
+                            self.recordingFinishContinuation = nil
+                            continuation.resume(throwing: error)
+                        }
+                    }
+                }
+                self.queue.asyncAfter(deadline: .now() + 12) {
+                    guard let continuation = self.recordingFinishContinuation else { return }
+                    self.recordingFinishContinuation = nil
+                    continuation.resume(throwing: RecorderError.saveFailed("原生录制器没有完成文件封装"))
+                }
+            }
+        }
     }
 
     private func exportProcessedMovie(
@@ -2473,86 +2323,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         return CGSize(width: width - width % 2, height: height - height % 2)
     }
 
-    private func saveMixedPlaybackAndSplitTrackVersions(from temporaryURL: URL, to finalURL: URL) async throws -> URL {
-        let splitURL = splitTrackSiblingURL(for: finalURL)
-        let mixedURL = temporaryURL.deletingLastPathComponent()
-            .appendingPathComponent("\(temporaryURL.deletingPathExtension().lastPathComponent)-mixed.mp4")
-
-        try? FileManager.default.removeItem(at: splitURL)
-        try? FileManager.default.removeItem(at: mixedURL)
-
-        do {
-            let actualAudioTrackCount = currentAudioCaptureSummary().trackCount
-            try FileManager.default.copyItem(at: temporaryURL, to: splitURL)
-            try await validatePlayableMovie(at: splitURL, expectedAudioTracks: actualAudioTrackCount)
-
-            try await exportMixedAudioMovie(from: splitURL, to: mixedURL)
-            try await validatePlayableMovie(at: mixedURL, expectedAudioTracks: 1)
-
-            try? FileManager.default.removeItem(at: temporaryURL)
-            return try commitTemporaryRecording(from: mixedURL, to: finalURL)
-        } catch {
-            try? FileManager.default.removeItem(at: mixedURL)
-            try? FileManager.default.removeItem(at: splitURL)
-            throw error
-        }
-    }
-
-    private func exportMixedAudioMovie(from sourceURL: URL, to outputURL: URL) async throws {
-        let asset = AVURLAsset(url: sourceURL)
-        let duration = try await asset.load(.duration)
-        let videoTracks = try await asset.loadTracks(withMediaType: .video)
-        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
-
-        guard let videoTrack = videoTracks.first else {
-            throw RecorderError.saveFailed("混音前没有找到视频轨")
-        }
-
-        let composition = AVMutableComposition()
-        guard let compositionVideoTrack = composition.addMutableTrack(
-            withMediaType: .video,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        ) else {
-            throw RecorderError.saveFailed("混音视频轨初始化失败")
-        }
-
-        try compositionVideoTrack.insertTimeRange(
-            CMTimeRange(start: .zero, duration: duration),
-            of: videoTrack,
-            at: .zero
-        )
-        compositionVideoTrack.preferredTransform = try await videoTrack.load(.preferredTransform)
-
-        var audioParameters: [AVMutableAudioMixInputParameters] = []
-        for (index, audioTrack) in audioTracks.enumerated() {
-            guard let compositionAudioTrack = composition.addMutableTrack(
-                withMediaType: .audio,
-                preferredTrackID: kCMPersistentTrackID_Invalid
-            ) else {
-                throw RecorderError.saveFailed("混音音频轨初始化失败")
-            }
-
-            try await insertAvailableAudioRange(from: audioTrack, into: compositionAudioTrack, videoDuration: duration)
-
-            let parameters = AVMutableAudioMixInputParameters(track: compositionAudioTrack)
-            // Track 0 is usually ScreenCaptureKit system audio, track 1 is microphone.
-            // Keep system audio full and put the mic slightly under it for a usable preview mix.
-            parameters.setVolume(index == 0 ? 1.0 : 0.85, at: .zero)
-            audioParameters.append(parameters)
-        }
-
-        let audioMix = AVMutableAudioMix()
-        audioMix.inputParameters = audioParameters
-
-        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-            throw RecorderError.saveFailed("混音导出器初始化失败")
-        }
-
-        exporter.audioMix = audioMix
-        exporter.shouldOptimizeForNetworkUse = true
-        try await exporter.export(to: outputURL, as: .mp4)
-    }
-
     private func insertAvailableAudioRange(
         from sourceTrack: AVAssetTrack,
         into destinationTrack: AVMutableCompositionTrack,
@@ -2589,35 +2359,21 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 
     private func reset() {
         stream = nil
-        writer = nil
-        videoInput = nil
-        audioInput = nil
-        microphoneInput = nil
-        startTime = nil
+        recordingOutput = nil
         finalOutputURL = nil
         temporaryOutputURL = nil
         postCropRect = nil
         outputResolution = .native
-        requestedSystemAudio = false
-        requestedMicrophone = false
-        videoSampleCount = 0
-        audioSampleCount = 0
-        microphoneSampleCount = 0
-        firstVideoFrameContinuation = nil
-        isFinishing = false
+        recordingStartContinuation = nil
+        recordingFinishContinuation = nil
+        recordingOutputError = nil
+        recordingDidStart = false
+        recordingDidFinish = false
     }
 
     private func resetAfterStop() {
         queue.sync {
             self.reset()
-        }
-    }
-
-    private func cancelWriterIfNeeded(_ writer: AVAssetWriter) {
-        queue.sync {
-            if writer.status == .unknown || writer.status == .writing {
-                writer.cancelWriting()
-            }
         }
     }
 
