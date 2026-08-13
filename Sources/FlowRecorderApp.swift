@@ -87,6 +87,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if model.isCountingDown {
+            model.cancelCountdown()
+            return .terminateNow
+        }
+
         if model.isBusy {
             showMainWindow()
             model.status = "正在保存视频，请等“已保存”后再退出，避免生成损坏视频。"
@@ -227,7 +232,7 @@ final class AppModel: ObservableObject {
         countdownSeconds = nil
     }
 
-    private func cancelCountdown() {
+    func cancelCountdown() {
         countdownTask?.cancel()
         countdownTask = nil
         countdownSeconds = nil
@@ -236,19 +241,19 @@ final class AppModel: ObservableObject {
     }
 
     func stopRecording() async {
-        guard isRecording || recorder.hasActiveRecording else { return }
+        guard !isBusy, (isRecording || recorder.hasActiveRecording) else { return }
         isBusy = true
         status = "正在保存视频，请不要关闭软件..."
         do {
-            let url = try await recorder.stop()
-            outputURL = url
+            let result = try await recorder.stop()
+            outputURL = result.url
             isRecording = false
             isBusy = false
-            if includeSystemAudio && includeMicrophone {
-                let splitName = recorder.splitTrackSiblingURL(for: url).lastPathComponent
-                status = "已保存：\(url.lastPathComponent)（直接播放版）；已同时生成：\(splitName)（分轨版）"
+            if result.hasSeparateAudioTracks {
+                let splitName = recorder.splitTrackSiblingURL(for: result.url).lastPathComponent
+                status = "已保存：\(result.url.lastPathComponent)（直接播放版）；已同时生成：\(splitName)（分轨版）"
             } else {
-                status = "已保存：\(url.lastPathComponent)"
+                status = "已保存：\(result.url.lastPathComponent)\(result.audioWarning)"
             }
             refreshRecordings()
         } catch {
@@ -400,6 +405,10 @@ final class AppModel: ObservableObject {
                 if seen.contains(option.id) { return false }
                 seen.insert(option.id)
                 return true
+            }
+            .sorted { lhs, rhs in
+                if lhs.appName != rhs.appName { return lhs.appName.localizedStandardCompare(rhs.appName) == .orderedAscending }
+                return lhs.frame.width * lhs.frame.height > rhs.frame.width * rhs.frame.height
             }
             .prefix(24)
             .map { $0 }
@@ -932,7 +941,7 @@ struct MainView: View {
                     microphonePicker
                 }
                 captureAreaControl
-                Text(model.includeMicrophone ? "会生成直接播放版；同时保留分轨版，方便后期分开调声音。" : "只录系统声时，文件更轻。需要讲解人声时再打开麦克风。")
+                Text(model.includeMicrophone ? "系统声和麦克风都正常写入时，会同时保留分轨版，方便后期分开调声音。" : "只录系统声时，文件更轻。需要讲解人声时再打开麦克风。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1868,6 +1877,12 @@ enum RecorderError: LocalizedError {
     }
 }
 
+struct RecordingStopResult {
+    let url: URL
+    let hasSeparateAudioTracks: Bool
+    let audioWarning: String
+}
+
 final class ScreenRecorder: NSObject, SCStreamOutput {
     private var stream: SCStream?
     private var writer: AVAssetWriter?
@@ -1879,7 +1894,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
     private var temporaryOutputURL: URL?
     private var postCropRect: CGRect?
     private var outputResolution = OutputResolutionPreset.native
-    private var expectedAudioTrackCount = 0
+    private var requestedSystemAudio = false
+    private var requestedMicrophone = false
     private var videoSampleCount = 0
     private var audioSampleCount = 0
     private var microphoneSampleCount = 0
@@ -1899,7 +1915,6 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         outputResolution: OutputResolutionPreset
     ) async throws -> URL {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else { throw RecorderError.noDisplay }
 
         let destination = makeOutputDestination()
         let writer = try AVAssetWriter(outputURL: destination.temporaryURL, fileType: .mp4)
@@ -1907,8 +1922,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
 
         let captureSetup = try makeCaptureSetup(
             target: captureTarget,
-            content: content,
-            display: display
+            content: content
         )
         let width = captureSetup.width
         let height = captureSetup.height
@@ -1994,7 +2008,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         self.temporaryOutputURL = destination.temporaryURL
         self.postCropRect = captureSetup.postCropRect
         self.outputResolution = outputResolution
-        self.expectedAudioTrackCount = (includeSystemAudio ? 1 : 0) + (includeMicrophone ? 1 : 0)
+        self.requestedSystemAudio = includeSystemAudio
+        self.requestedMicrophone = includeMicrophone
         self.videoSampleCount = 0
         self.audioSampleCount = 0
         self.microphoneSampleCount = 0
@@ -2013,7 +2028,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         }
     }
 
-    func stop() async throws -> URL {
+    func stop() async throws -> RecordingStopResult {
         guard let stream, let writer, let finalOutputURL, let temporaryOutputURL else {
             throw RecorderError.writerNotReady
         }
@@ -2028,6 +2043,7 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
             }
 
             let actualAudioTrackCount = currentExpectedWrittenAudioTrackCount()
+            let audioWarning = missingAudioWarning()
             try await finishWriter(writer)
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: actualAudioTrackCount)
 
@@ -2059,7 +2075,11 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 appendRecorderNote("stopCapture 抛错但文件已成功封装：\(saveFailureText(from: stopCaptureError))")
             }
             resetAfterStop()
-            return savedURL
+            return RecordingStopResult(
+                url: savedURL,
+                hasSeparateAudioTracks: actualAudioTrackCount > 1,
+                audioWarning: audioWarning
+            )
         } catch {
             cancelWriterIfNeeded(writer)
             var moved: URL?
@@ -2205,17 +2225,33 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         "样本统计：画面 \(videoSampleCount)，系统声 \(audioSampleCount)，麦克风 \(microphoneSampleCount)"
     }
 
+    private func missingAudioWarning() -> String {
+        let missingSystemAudio = requestedSystemAudio && audioSampleCount == 0
+        let missingMicrophone = requestedMicrophone && microphoneSampleCount == 0
+        switch (missingSystemAudio, missingMicrophone) {
+        case (true, true):
+            return "；但没有收到系统声音或麦克风输入"
+        case (true, false):
+            return "；但没有收到系统声音"
+        case (false, true):
+            return "；但没有收到麦克风输入"
+        case (false, false):
+            return ""
+        }
+    }
+
     private func makeCaptureSetup(
         target: RecorderCaptureTarget,
-        content: SCShareableContent,
-        display: SCDisplay
+        content: SCShareableContent
     ) throws -> (filter: SCContentFilter, sourceRect: CGRect?, width: Int, height: Int, postCropRect: CGRect?) {
-        let displayFrame = display.frame
-        let fullSize = normalizedVideoSize(from: displayFrame.size)
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-
         switch target {
         case .display(let captureRect):
+            guard let display = displayForCaptureRect(captureRect, displays: content.displays) else {
+                throw RecorderError.noDisplay
+            }
+            let displayFrame = display.frame
+            let fullSize = normalizedVideoSize(from: displayFrame.size)
+            let filter = SCContentFilter(display: display, excludingWindows: [])
             let postCropRect = captureRect.map { normalizedSourceRect($0, displayFrame: displayFrame) }
             return (
                 filter: filter,
@@ -2231,7 +2267,14 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 throw RecorderError.windowNotFound
             }
 
-            let sourceRect = normalizedSourceRect(windowFrame, displayFrame: display.frame)
+            guard let display = displayForCaptureRect(windowFrame, displays: content.displays) else {
+                throw RecorderError.noDisplay
+            }
+            let displayFrame = display.frame
+            let fullSize = normalizedVideoSize(from: displayFrame.size)
+            let filter = SCContentFilter(display: display, excludingWindows: [])
+
+            let sourceRect = normalizedSourceRect(windowFrame, displayFrame: displayFrame)
             // Window selection is intentionally implemented as stable full-screen capture
             // followed by a crop. Some apps (notably video/web apps) swap rendering layers
             // after navigation. Keeping the live capture path identical to full-screen
@@ -2243,6 +2286,16 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
                 height: fullSize.height,
                 postCropRect: sourceRect
             )
+        }
+    }
+
+    private func displayForCaptureRect(_ captureRect: CGRect?, displays: [SCDisplay]) -> SCDisplay? {
+        guard !displays.isEmpty else { return nil }
+        guard let captureRect else { return displays.first }
+        return displays.max { lhs, rhs in
+            let lhsIntersection = lhs.frame.intersection(captureRect)
+            let rhsIntersection = rhs.frame.intersection(captureRect)
+            return lhsIntersection.width * lhsIntersection.height < rhsIntersection.width * rhsIntersection.height
         }
     }
 
@@ -2537,7 +2590,8 @@ final class ScreenRecorder: NSObject, SCStreamOutput {
         temporaryOutputURL = nil
         postCropRect = nil
         outputResolution = .native
-        expectedAudioTrackCount = 0
+        requestedSystemAudio = false
+        requestedMicrophone = false
         videoSampleCount = 0
         audioSampleCount = 0
         microphoneSampleCount = 0
