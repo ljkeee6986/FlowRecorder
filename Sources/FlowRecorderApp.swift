@@ -1,7 +1,7 @@
 import AppKit
 import AVFoundation
 import CoreImage
-import ScreenCaptureKit
+@preconcurrency import ScreenCaptureKit
 import SwiftUI
 
 @main
@@ -570,7 +570,7 @@ final class AppModel: ObservableObject {
         let text = "[\(Date())] \(value)\n"
         if let handle = try? FileHandle(forWritingTo: file) {
             defer { try? handle.close() }
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: Data(text.utf8))
         } else {
             try? text.write(to: file, atomically: true, encoding: .utf8)
@@ -2010,18 +2010,18 @@ struct RecordingStopResult {
     let clickOverlayFailed: Bool
 }
 
-private enum MouseClickButton {
+private enum MouseClickButton: Sendable {
     case left
     case right
 }
 
-private struct MouseClickMarker {
+private struct MouseClickMarker: Sendable {
     let timestamp: TimeInterval
     let location: CGPoint
     let button: MouseClickButton
 }
 
-private struct RenderedMouseClickMarker {
+private struct RenderedMouseClickMarker: Sendable {
     let timestamp: TimeInterval
     let point: CGPoint
     let button: MouseClickButton
@@ -2884,7 +2884,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         let text = "[\(Date())] 调试：\(message)\n"
         if let handle = try? FileHandle(forWritingTo: file) {
             defer { try? handle.close() }
-            try? handle.seekToEnd()
+            _ = try? handle.seekToEnd()
             try? handle.write(contentsOf: Data(text.utf8))
         } else {
             try? text.write(to: file, atomically: true, encoding: .utf8)
