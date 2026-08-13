@@ -108,6 +108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class AppModel: ObservableObject {
     @Published var isRecording = false
     @Published var isBusy = false
+    @Published private(set) var countdownSeconds: Int?
     @Published var status = "准备就绪" {
         didSet { writeStatus(status) }
     }
@@ -132,6 +133,11 @@ final class AppModel: ObservableObject {
     """
 
     private let recorder = ScreenRecorder()
+    private var countdownTask: Task<Void, Never>?
+
+    var isCountingDown: Bool {
+        countdownSeconds != nil
+    }
 
     init() {
         recorder.recoverInterruptedRecordings()
@@ -141,11 +147,15 @@ final class AppModel: ObservableObject {
     }
 
     func toggleRecording() {
-        guard !isBusy else { return }
         if isRecording {
             Task { await stopRecording() }
+        } else if isCountingDown {
+            cancelCountdown()
         } else {
-            Task { await startRecording() }
+            guard !isBusy else { return }
+            countdownTask = Task { @MainActor [weak self] in
+                await self?.startRecording()
+            }
         }
     }
 
@@ -174,6 +184,8 @@ final class AppModel: ObservableObject {
                 }
             }
 
+            try await runCountdown()
+
             status = "正在准备录制..."
             let microphoneDeviceID = includeMicrophone ? selectedMicrophoneDevice?.uniqueID : nil
             let captureTarget: RecorderCaptureTarget = {
@@ -191,13 +203,34 @@ final class AppModel: ObservableObject {
             outputURL = nil
             isRecording = true
             isBusy = false
+            countdownTask = nil
             status = "录制中：\(url.lastPathComponent)"
         } catch {
             isRecording = false
             isBusy = false
-            status = "启动失败：\(humanReadable(error))"
+            countdownTask = nil
+            status = error is CancellationError ? "已取消倒计时。" : "启动失败：\(humanReadable(error))"
             refreshRecordings()
         }
+    }
+
+    private func runCountdown() async throws {
+        isBusy = true
+        for seconds in stride(from: 3, through: 1, by: -1) {
+            try Task.checkCancellation()
+            countdownSeconds = seconds
+            status = "\(seconds) 秒后开始录制，点击录制按钮可取消。"
+            try await Task.sleep(for: .seconds(1))
+        }
+        countdownSeconds = nil
+    }
+
+    private func cancelCountdown() {
+        countdownTask?.cancel()
+        countdownTask = nil
+        countdownSeconds = nil
+        isBusy = false
+        status = "已取消倒计时。"
     }
 
     func stopRecording() async {
@@ -719,8 +752,8 @@ struct MainView: View {
     }
 
     private var statusPill: some View {
-        let text = model.isRecording ? "REC" : (model.isBusy ? "SAVING" : "READY")
-        let tint = model.isRecording ? Color.red : (model.isBusy ? Color.orange : freshMint)
+        let text = model.isRecording ? "REC" : (model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : "READY"))
+        let tint = model.isRecording ? Color.red : (model.isCountingDown ? Color.orange : (model.isBusy ? Color.orange : freshMint))
         return HStack(spacing: 8) {
             Circle().fill(tint).frame(width: 8, height: 8)
             Text(text)
@@ -738,9 +771,9 @@ struct MainView: View {
         freshPanel {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(model.isRecording ? "正在录制" : "准备开始")
+                    Text(model.isRecording ? "正在录制" : (model.isCountingDown ? "即将开始" : "准备开始"))
                         .font(.system(size: 24, weight: .semibold, design: .rounded))
-                    Text(model.isRecording ? "录制中请保持窗口状态稳定" : "确认来源后，一键开始录制")
+                    Text(model.isRecording ? "录制中请保持窗口状态稳定" : (model.isCountingDown ? "倒计时期间点击按钮即可取消" : "确认来源后，3 秒倒计时开始录制"))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -749,23 +782,29 @@ struct MainView: View {
                 } label: {
                     ZStack {
                         Circle()
-                            .fill(model.isRecording ? Color.red.gradient : freshBlue.gradient)
+                            .fill(model.isRecording ? Color.red.gradient : (model.isCountingDown ? Color.orange.gradient : freshBlue.gradient))
                             .frame(width: 108, height: 108)
-                            .shadow(color: (model.isRecording ? Color.red : freshBlue).opacity(0.22), radius: 20, x: 0, y: 12)
-                        Image(systemName: model.isRecording ? "stop.fill" : "record.circle")
-                            .font(.system(size: 44, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .shadow(color: (model.isRecording ? Color.red : (model.isCountingDown ? Color.orange : freshBlue)).opacity(0.22), radius: 20, x: 0, y: 12)
+                        if let seconds = model.countdownSeconds {
+                            Text("\(seconds)")
+                                .font(.system(size: 48, weight: .bold, design: .rounded))
+                                .foregroundStyle(.white)
+                        } else {
+                            Image(systemName: model.isRecording ? "stop.fill" : "record.circle")
+                                .font(.system(size: 44, weight: .semibold))
+                                .foregroundStyle(.white)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 10)
                 }
                 .buttonStyle(.plain)
                 .keyboardShortcut("r", modifiers: [.command])
-                .disabled(model.isBusy)
+                .disabled(model.isBusy && !model.isCountingDown)
                 HStack {
-                    Label("快捷键 ⌘R", systemImage: "keyboard")
+                    Label(model.isCountingDown ? "点击取消" : "快捷键 ⌘R", systemImage: model.isCountingDown ? "xmark.circle" : "keyboard")
                     Spacer()
-                    Text(model.isBusy ? "正在处理..." : "状态稳定")
+                    Text(model.isCountingDown ? "即将录制" : (model.isBusy ? "正在处理..." : "状态稳定"))
                 }
                 .font(.caption.weight(.medium))
                 .foregroundStyle(.secondary)
