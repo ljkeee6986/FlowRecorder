@@ -330,7 +330,10 @@ final class AppModel: ObservableObject {
         isBusy = true
         status = "正在保存视频，请不要关闭软件..."
         do {
-            let result = try await recorder.stop()
+            let result = try await recorder.stop { [weak self] message in
+                guard let self, self.isBusy else { return }
+                self.status = message
+            }
             outputURL = result.url
             isRecording = false
             isBusy = false
@@ -985,8 +988,8 @@ struct MainView: View {
     }
 
     private var statusPill: some View {
-        let text = model.isRecording ? "REC" : (model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : "READY"))
-        let tint = model.isRecording ? Color.red : (model.isCountingDown ? Color.orange : (model.isBusy ? Color.orange : freshMint))
+        let text = model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : (model.isRecording ? "REC" : "READY"))
+        let tint = model.isCountingDown ? Color.orange : (model.isBusy ? Color.orange : (model.isRecording ? Color.red : freshMint))
         return HStack(spacing: 8) {
             Circle().fill(tint).frame(width: 8, height: 8)
             Text(text)
@@ -1587,21 +1590,29 @@ struct RecordingControlsView: View {
         String(format: "%02d:%02d", model.recordingElapsed / 60, model.recordingElapsed % 60)
     }
 
+    private var stateLabel: String {
+        model.isBusy ? "SAVING" : "REC"
+    }
+
+    private var stateTint: Color {
+        model.isBusy ? Color.orange : Color(red: 1.0, green: 0.27, blue: 0.30)
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             Circle()
-                .fill(Color(red: 1.0, green: 0.27, blue: 0.30))
+                .fill(stateTint)
                 .frame(width: 10, height: 10)
-                .shadow(color: .red.opacity(0.55), radius: 5)
+                .shadow(color: stateTint.opacity(0.55), radius: 5)
 
-            Text("REC")
+            Text(stateLabel)
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.70))
 
-            Text(elapsedText)
+            Text(model.isBusy ? "封装中" : elapsedText)
                 .font(.system(size: 17, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white)
-                .frame(width: 58, alignment: .leading)
+                .frame(width: 68, alignment: .leading)
 
             Divider()
                 .frame(height: 20)
@@ -1620,7 +1631,7 @@ struct RecordingControlsView: View {
             Button {
                 Task { await model.stopRecording() }
             } label: {
-                Image(systemName: "stop.fill")
+                Image(systemName: model.isBusy ? "hourglass" : "stop.fill")
                     .font(.system(size: 13, weight: .bold))
                     .foregroundStyle(Color(red: 0.12, green: 0.13, blue: 0.16))
                     .frame(width: 30, height: 30)
@@ -1631,7 +1642,7 @@ struct RecordingControlsView: View {
             .help("停止录制")
         }
         .padding(.horizontal, 13)
-        .frame(width: 360, height: 52)
+        .frame(width: 374, height: 52)
         .background(Color(red: 0.07, green: 0.08, blue: 0.10), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 1))
     }
@@ -2271,7 +2282,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         }
     }
 
-    func stop() async throws -> RecordingStopResult {
+    func stop(progress: @escaping @MainActor (String) -> Void = { _ in }) async throws -> RecordingStopResult {
         guard let stream, let finalOutputURL, let temporaryOutputURL else {
             throw RecorderError.writerNotReady
         }
@@ -2285,7 +2296,9 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             "stop begin temp=\(temporaryOutputURL.lastPathComponent) final=\(finalOutputURL.lastPathComponent) crop=\(rectDescription(postCropRect)) resolution=\(outputResolution.label) capturedClicks=\(capturedClickMarkers.count) requiresProcessing=\(requiresProcessing)"
         )
         do {
+            await progress("正在结束录制并封装原始 MP4...")
             try await finishNativeRecording(stream)
+            await progress("正在验证原始 MP4 是否可播放...")
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: 0)
             appendRecorderNote("native mp4 ready \(fileSummary(temporaryOutputURL))")
 
@@ -2297,6 +2310,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 appendRecorderNote(
                     "postprocess begin output=\(processedURL.lastPathComponent) crop=\(rectDescription(postCropRect)) maxLongEdge=\(outputResolution.maximumLongEdge.map { String(Int($0)) } ?? "native") clicks=\(capturedClickMarkers.count)"
                 )
+                await progress(processingStatus(requiresProcessing: requiresProcessing, clickCount: capturedClickMarkers.count))
                 do {
                     renderedClickCount = try await exportProcessedMovie(
                         from: temporaryOutputURL,
@@ -2308,9 +2322,11 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 } catch {
                     guard !capturedClickMarkers.isEmpty else { throw error }
                     appendRecorderNote("click overlay failed, preserving playable base path: \(saveFailureText(from: error))")
+                    await progress("点击提示处理失败，正在保留可播放视频...")
                     clickOverlayFailed = true
                     try? FileManager.default.removeItem(at: processedURL)
                     if requiresProcessing {
+                        await progress("正在保留清晰度/区域处理，不叠加点击提示...")
                         renderedClickCount = try await exportProcessedMovie(
                             from: temporaryOutputURL,
                             to: processedURL,
@@ -2325,14 +2341,17 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                     }
                 }
                 if FileManager.default.fileExists(atPath: processedURL.path) {
+                    await progress("正在验证处理后 MP4 是否可播放...")
                     try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
                     appendRecorderNote("postprocess ready \(fileSummary(processedURL)) renderedClicks=\(renderedClickCount) overlayFailed=\(clickOverlayFailed)")
                     workingURL = processedURL
                 }
             }
 
+            await progress("正在写入最终 MP4 文件...")
             let savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
             appendRecorderNote("commit complete \(fileSummary(savedURL))")
+            await progress("最终文件已写入，正在清理临时文件...")
             for url in filesToQuarantine where url != savedURL {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -2355,6 +2374,18 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             resetAfterStop()
             throw RecorderError.saveFailed(failureMessage(saveFailureText(from: error), moved: moved))
         }
+    }
+
+    private func processingStatus(requiresProcessing: Bool, clickCount: Int) -> String {
+        var parts = [String]()
+        if requiresProcessing {
+            parts.append("清晰度/区域")
+        }
+        if clickCount > 0 {
+            parts.append("点击提示")
+        }
+        let detail = parts.isEmpty ? "视频" : parts.joined(separator: "、")
+        return "正在处理\(detail)，请不要关闭软件..."
     }
 
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
