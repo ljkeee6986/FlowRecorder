@@ -95,14 +95,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if model.isBusy {
             showMainWindow()
-            model.status = "正在保存视频，请等“已保存”后再退出，避免生成损坏视频。"
+            model.status = "正在安全保存视频，保存完成前不能退出；强制退出可能生成损坏录屏。"
             return .terminateCancel
         }
 
-        if model.isRecording {
+        if model.isRecording || model.hasActiveRecording {
+            showMainWindow()
+            model.status = "正在安全停止并保存，保存完成后自动退出；请不要强制退出。"
             Task { @MainActor in
-                await model.stopRecording()
-                NSApp.terminate(nil)
+                let saved = await model.stopRecording()
+                if !saved {
+                    showMainWindow()
+                    if !model.status.contains("已取消退出") {
+                        if model.status.isEmpty {
+                            model.status = "保存失败，已取消退出；请复制诊断后再处理。"
+                        } else {
+                            model.status = "\(model.status)；已取消退出，请复制诊断后再处理。"
+                        }
+                    }
+                }
+                NSApp.reply(toApplicationShouldTerminate: saved)
             }
             return .terminateLater
         }
@@ -183,6 +195,10 @@ final class AppModel: ObservableObject {
 
     var isCountingDown: Bool {
         countdownSeconds != nil
+    }
+
+    var hasActiveRecording: Bool {
+        recorder.hasActiveRecording
     }
 
     init() {
@@ -496,8 +512,10 @@ final class AppModel: ObservableObject {
         status = "已取消倒计时。"
     }
 
-    func stopRecording() async {
-        guard !isBusy, (isRecording || recorder.hasActiveRecording) else { return }
+    @discardableResult
+    func stopRecording() async -> Bool {
+        guard !isBusy else { return false }
+        guard isRecording || recorder.hasActiveRecording else { return true }
         isBusy = true
         status = "正在保存视频，请不要关闭软件..."
         do {
@@ -518,6 +536,7 @@ final class AppModel: ObservableObject {
                 status = "已保存：\(result.url.lastPathComponent)"
             }
             refreshRecordings()
+            return true
         } catch {
             isRecording = false
             isBusy = false
@@ -525,6 +544,7 @@ final class AppModel: ObservableObject {
             OverlayManager.shared.hideRecordingControls()
             status = "保存失败：\(humanReadable(error))"
             refreshRecordings()
+            return false
         }
     }
 
@@ -2056,10 +2076,10 @@ struct RecordingControlsView: View {
                 .font(.system(size: 12, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.70))
 
-            Text(model.isBusy ? "封装中" : elapsedText)
+            Text(model.isBusy ? "安全保存" : elapsedText)
                 .font(.system(size: 17, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white)
-                .frame(width: 68, alignment: .leading)
+                .frame(width: 78, alignment: .leading)
 
             Divider()
                 .frame(height: 20)
@@ -2086,10 +2106,10 @@ struct RecordingControlsView: View {
             }
             .buttonStyle(.plain)
             .disabled(model.isBusy || !model.isRecording)
-            .help("停止录制")
+            .help(model.isBusy ? "正在安全保存，请不要强制退出" : "停止录制")
         }
         .padding(.horizontal, 13)
-        .frame(width: 374, height: 52)
+        .frame(width: 386, height: 52)
         .background(Color(red: 0.07, green: 0.08, blue: 0.10), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 1))
     }
