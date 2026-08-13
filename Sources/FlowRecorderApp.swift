@@ -121,40 +121,117 @@ final class AppModel: ObservableObject {
     }
     @Published var outputURL: URL?
     @Published var recentRecordings: [RecordingItem] = []
-    @Published var includeSystemAudio = true
-    @Published var includeMicrophone = false
-    @Published var highlightMouseClicks = true
-    @Published var outputResolution = OutputResolutionPreset.native
+    @Published var includeSystemAudio = true {
+        didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
+    }
+    @Published var includeMicrophone = false {
+        didSet { persist(includeMicrophone, forKey: DefaultsKey.includeMicrophone) }
+    }
+    @Published var highlightMouseClicks = true {
+        didSet { persist(highlightMouseClicks, forKey: DefaultsKey.highlightMouseClicks) }
+    }
+    @Published var outputResolution = OutputResolutionPreset.native {
+        didSet { persist(outputResolution.rawValue, forKey: DefaultsKey.outputResolution) }
+    }
     @Published var microphoneDevices: [MicrophoneDevice] = []
-    @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID
+    @Published var selectedMicrophoneDeviceID = MicrophoneDevice.systemDefaultID {
+        didSet { persist(selectedMicrophoneDeviceID, forKey: DefaultsKey.selectedMicrophoneDeviceID) }
+    }
     @Published var selectedCaptureRect: CGRect?
     @Published var selectedWindowID: CGWindowID?
     @Published var selectedWindowFrame: CGRect?
     @Published var windowOptions: [WindowCaptureOption] = []
     @Published var isRefreshingWindows = false
-    @Published var teleprompterFontSize = 28.0
-    @Published var teleprompterScrollSpeed = 0.0
-    @Published var teleprompterText = """
+    @Published var teleprompterFontSize = 28.0 {
+        didSet { persist(teleprompterFontSize, forKey: DefaultsKey.teleprompterFontSize) }
+    }
+    @Published var teleprompterScrollSpeed = 0.0 {
+        didSet { persist(teleprompterScrollSpeed, forKey: DefaultsKey.teleprompterScrollSpeed) }
+    }
+    @Published var teleprompterText = AppModel.defaultTeleprompterText {
+        didSet { persist(teleprompterText, forKey: DefaultsKey.teleprompterText) }
+    }
+
+    private let recorder = ScreenRecorder()
+    private var countdownTask: Task<Void, Never>?
+    private var recordingTimer: Timer?
+    private var recordingStartedAt: Date?
+    private var isLoadingPersistentSettings = false
+
+    private enum DefaultsKey {
+        static let includeSystemAudio = "FlowRecorder.includeSystemAudio"
+        static let includeMicrophone = "FlowRecorder.includeMicrophone"
+        static let highlightMouseClicks = "FlowRecorder.highlightMouseClicks"
+        static let outputResolution = "FlowRecorder.outputResolution"
+        static let selectedMicrophoneDeviceID = "FlowRecorder.selectedMicrophoneDeviceID"
+        static let teleprompterFontSize = "FlowRecorder.teleprompterFontSize"
+        static let teleprompterScrollSpeed = "FlowRecorder.teleprompterScrollSpeed"
+        static let teleprompterText = "FlowRecorder.teleprompterText"
+    }
+
+    private static let defaultTeleprompterText = """
     开场先讲清楚这条视频要解决什么问题。
 
     录制时可以打开提词器，它会悬浮在屏幕上方便看稿。
     摄像头小窗可以拖到角落，用来做教程、演示、课程、作品讲解。
     """
 
-    private let recorder = ScreenRecorder()
-    private var countdownTask: Task<Void, Never>?
-    private var recordingTimer: Timer?
-    private var recordingStartedAt: Date?
-
     var isCountingDown: Bool {
         countdownSeconds != nil
     }
 
     init() {
+        loadPersistentSettings()
         recorder.recoverInterruptedRecordings()
         refreshMicrophoneDevices()
         writeStatus(status)
         refreshRecordings()
+    }
+
+    private func persist(_ value: Any, forKey key: String) {
+        guard !isLoadingPersistentSettings else { return }
+        UserDefaults.standard.set(value, forKey: key)
+    }
+
+    private func loadPersistentSettings() {
+        isLoadingPersistentSettings = true
+        defer { isLoadingPersistentSettings = false }
+
+        let defaults = UserDefaults.standard
+
+        if defaults.object(forKey: DefaultsKey.includeSystemAudio) != nil {
+            includeSystemAudio = defaults.bool(forKey: DefaultsKey.includeSystemAudio)
+        }
+        if defaults.object(forKey: DefaultsKey.includeMicrophone) != nil {
+            includeMicrophone = defaults.bool(forKey: DefaultsKey.includeMicrophone)
+                && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        }
+        if defaults.object(forKey: DefaultsKey.highlightMouseClicks) != nil {
+            highlightMouseClicks = defaults.bool(forKey: DefaultsKey.highlightMouseClicks)
+        }
+        if let rawValue = defaults.string(forKey: DefaultsKey.outputResolution),
+           let preset = OutputResolutionPreset(rawValue: rawValue) {
+            outputResolution = preset
+        }
+        if let deviceID = defaults.string(forKey: DefaultsKey.selectedMicrophoneDeviceID),
+           !deviceID.isEmpty {
+            selectedMicrophoneDeviceID = deviceID
+        }
+
+        let fontSize = defaults.double(forKey: DefaultsKey.teleprompterFontSize)
+        if fontSize.isFinite, fontSize > 0 {
+            teleprompterFontSize = min(max(fontSize, 18), 52)
+        }
+
+        let scrollSpeed = defaults.double(forKey: DefaultsKey.teleprompterScrollSpeed)
+        if scrollSpeed.isFinite, scrollSpeed >= 0 {
+            teleprompterScrollSpeed = min(max(scrollSpeed, 0), 90)
+        }
+
+        if let savedText = defaults.string(forKey: DefaultsKey.teleprompterText),
+           !savedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            teleprompterText = savedText
+        }
     }
 
     func toggleRecording() {
