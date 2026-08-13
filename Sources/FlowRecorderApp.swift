@@ -364,7 +364,8 @@ final class AppModel: ObservableObject {
                 title: "输出目录",
                 detail: "可写入",
                 systemImage: "folder.fill",
-                tone: .ok
+                tone: .ok,
+                action: .openOutputFolder
             ))
         } catch {
             items.append(RecordingHealthItem(
@@ -372,7 +373,8 @@ final class AppModel: ObservableObject {
                 title: "输出目录",
                 detail: conciseHealthText(humanReadable(error)),
                 systemImage: "folder.fill",
-                tone: .error
+                tone: .error,
+                action: .openOutputFolder
             ))
         }
 
@@ -385,7 +387,8 @@ final class AppModel: ObservableObject {
                 title: "屏幕录制",
                 detail: captureAreaDescription,
                 systemImage: "display",
-                tone: .ok
+                tone: .ok,
+                action: .none
             ))
         } catch {
             items.append(RecordingHealthItem(
@@ -393,7 +396,8 @@ final class AppModel: ObservableObject {
                 title: "屏幕录制",
                 detail: conciseHealthText(humanReadable(error)),
                 systemImage: "display",
-                tone: .error
+                tone: .error,
+                action: .openScreenRecordingSettings
             ))
         }
 
@@ -408,7 +412,8 @@ final class AppModel: ObservableObject {
                 title: "磁盘空间",
                 detail: "无法读取",
                 systemImage: "internaldrive",
-                tone: .warning
+                tone: .warning,
+                action: .openOutputFolder
             )
         }
 
@@ -418,7 +423,8 @@ final class AppModel: ObservableObject {
             title: "磁盘空间",
             detail: detail,
             systemImage: "internaldrive.fill",
-            tone: freeBytes >= Self.minimumFreeDiskSpaceBytes ? .ok : .error
+            tone: freeBytes >= Self.minimumFreeDiskSpaceBytes ? .ok : .error,
+            action: freeBytes >= Self.minimumFreeDiskSpaceBytes ? .none : .openOutputFolder
         )
     }
 
@@ -429,7 +435,8 @@ final class AppModel: ObservableObject {
                 title: "麦克风",
                 detail: "关闭",
                 systemImage: "mic.slash.fill",
-                tone: .neutral
+                tone: .neutral,
+                action: .none
             )
         }
 
@@ -440,7 +447,8 @@ final class AppModel: ObservableObject {
                 title: "麦克风",
                 detail: selectedMicrophoneDevice?.name ?? "可录入",
                 systemImage: "mic.fill",
-                tone: .ok
+                tone: .ok,
+                action: .none
             )
         case .notDetermined:
             return RecordingHealthItem(
@@ -448,7 +456,8 @@ final class AppModel: ObservableObject {
                 title: "麦克风",
                 detail: "开始时请求",
                 systemImage: "mic.fill",
-                tone: .warning
+                tone: .warning,
+                action: .none
             )
         default:
             return RecordingHealthItem(
@@ -456,7 +465,8 @@ final class AppModel: ObservableObject {
                 title: "麦克风",
                 detail: "未授权",
                 systemImage: "mic.slash.fill",
-                tone: .error
+                tone: .error,
+                action: .openMicrophoneSettings
             )
         }
     }
@@ -582,6 +592,19 @@ final class AppModel: ObservableObject {
         pasteboard.clearContents()
         pasteboard.setString(buildDiagnosticsSnapshot(), forType: .string)
         status = "诊断信息已复制到剪贴板。"
+    }
+
+    func performRecordingHealthAction(_ action: RecordingHealthAction) {
+        switch action {
+        case .none:
+            return
+        case .openOutputFolder:
+            openOutputFolder()
+        case .openScreenRecordingSettings:
+            openPrivacySettings()
+        case .openMicrophoneSettings:
+            openMicrophoneSettings()
+        }
     }
 
     var selectedMicrophoneDevice: MicrophoneDevice? {
@@ -1111,12 +1134,20 @@ enum RecordingHealthTone {
     case neutral
 }
 
+enum RecordingHealthAction: Equatable {
+    case none
+    case openOutputFolder
+    case openScreenRecordingSettings
+    case openMicrophoneSettings
+}
+
 struct RecordingHealthItem: Identifiable {
     let id: String
     let title: String
     let detail: String
     let systemImage: String
     let tone: RecordingHealthTone
+    let action: RecordingHealthAction
 
     static let initialItems = [
         RecordingHealthItem(
@@ -1124,28 +1155,32 @@ struct RecordingHealthItem: Identifiable {
             title: "输出目录",
             detail: "待检查",
             systemImage: "folder.fill",
-            tone: .neutral
+            tone: .neutral,
+            action: .none
         ),
         RecordingHealthItem(
             id: "disk",
             title: "磁盘空间",
             detail: "待检查",
             systemImage: "internaldrive",
-            tone: .neutral
+            tone: .neutral,
+            action: .none
         ),
         RecordingHealthItem(
             id: "screen",
             title: "屏幕录制",
             detail: "待检查",
             systemImage: "display",
-            tone: .neutral
+            tone: .neutral,
+            action: .none
         ),
         RecordingHealthItem(
             id: "microphone",
             title: "麦克风",
             detail: "待检查",
             systemImage: "mic.fill",
-            tone: .neutral
+            tone: .neutral,
+            action: .none
         )
     ]
 }
@@ -1453,6 +1488,15 @@ struct MainView: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 0)
+            if item.action != .none && item.tone != .ok {
+                Button(recordingHealthActionTitle(item.action)) {
+                    model.performRecordingHealthAction(item.action)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(tint)
+                .disabled(model.isRecording || model.isBusy)
+            }
             Image(systemName: recordingHealthStatusSymbol(item.tone))
                 .font(.system(size: 11, weight: .bold))
                 .foregroundStyle(tint.opacity(item.tone == .neutral ? 0.50 : 0.95))
@@ -1486,6 +1530,17 @@ struct MainView: View {
             return "xmark.circle.fill"
         case .neutral:
             return "circle"
+        }
+    }
+
+    private func recordingHealthActionTitle(_ action: RecordingHealthAction) -> String {
+        switch action {
+        case .none:
+            return ""
+        case .openOutputFolder:
+            return "打开"
+        case .openScreenRecordingSettings, .openMicrophoneSettings:
+            return "设置"
         }
     }
 
