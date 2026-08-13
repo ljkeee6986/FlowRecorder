@@ -2693,6 +2693,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
     private var captureDisplayFrame: CGRect?
     private var outputResolution = OutputResolutionPreset.native
     private var shouldHighlightMouseClicks = false
+    private var expectedAudioTrackCount = 0
     private var mouseClickMonitors: [Any] = []
     private var clickMarkers: [MouseClickMarker] = []
     private var recordingStartContinuation: CheckedContinuation<Void, Error>?
@@ -2763,6 +2764,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         self.captureDisplayFrame = captureSetup.displayFrame
         self.outputResolution = outputResolution
         self.shouldHighlightMouseClicks = highlightMouseClicks
+        self.expectedAudioTrackCount = (includeSystemAudio || includeMicrophone) ? 1 : 0
         self.clickMarkers = []
         self.recordingOutputError = nil
         self.recordingDidStart = false
@@ -2790,17 +2792,18 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
 
         let capturedClickMarkers = await stopMouseClickCaptureAndSnapshot()
         let requiresProcessing = postCropRect != nil || outputResolution.maximumLongEdge != nil
+        let expectedAudioTrackCount = self.expectedAudioTrackCount
         var renderedClickCount = 0
         var clickOverlayFailed = false
         var filesToQuarantine = [temporaryOutputURL]
         appendRecorderNote(
-            "stop begin temp=\(temporaryOutputURL.lastPathComponent) final=\(finalOutputURL.lastPathComponent) crop=\(rectDescription(postCropRect)) resolution=\(outputResolution.label) capturedClicks=\(capturedClickMarkers.count) requiresProcessing=\(requiresProcessing)"
+            "stop begin temp=\(temporaryOutputURL.lastPathComponent) final=\(finalOutputURL.lastPathComponent) crop=\(rectDescription(postCropRect)) resolution=\(outputResolution.label) expectedAudioTracks=\(expectedAudioTrackCount) capturedClicks=\(capturedClickMarkers.count) requiresProcessing=\(requiresProcessing)"
         )
         do {
             await progress("正在结束录制并封装原始 MP4...")
             try await finishNativeRecording(stream)
             await progress("正在验证原始 MP4 是否可播放...")
-            try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: 0)
+            try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: expectedAudioTrackCount)
             appendRecorderNote("native mp4 ready \(fileSummary(temporaryOutputURL))")
 
             var workingURL = temporaryOutputURL
@@ -2843,7 +2846,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 }
                 if FileManager.default.fileExists(atPath: processedURL.path) {
                     await progress("正在验证处理后 MP4 是否可播放...")
-                    try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
+                    try await validatePlayableMovie(at: processedURL, expectedAudioTracks: expectedAudioTrackCount)
                     appendRecorderNote("postprocess ready \(fileSummary(processedURL)) renderedClicks=\(renderedClickCount) overlayFailed=\(clickOverlayFailed)")
                     workingURL = processedURL
                 }
@@ -3534,6 +3537,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         captureDisplayFrame = nil
         outputResolution = .native
         shouldHighlightMouseClicks = false
+        expectedAudioTrackCount = 0
         clickMarkers = []
         recordingStartContinuation = nil
         recordingFinishContinuation = nil
