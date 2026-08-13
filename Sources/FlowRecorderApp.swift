@@ -926,7 +926,7 @@ final class AppModel: ObservableObject {
         selectedWindowID = option.id
         selectedWindowFrame = option.frame
         selectedCaptureRect = nil
-        status = "已选择窗口区域：\(option.displayName)。页面播放会录进去；移动窗口后请重新选择。"
+        status = "已选择窗口区域：\(option.displayName)。页面播放会录进去；录制过程中不要移动窗口。"
     }
 
     func reveal(_ item: RecordingItem) {
@@ -3117,11 +3117,13 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 displayFrame: displayFrame
             )
 
-        case .window(let windowID, let fallbackFrame):
-            let liveFrame = content.windows.first(where: { $0.windowID == windowID })?.frame
-            guard let windowFrame = liveFrame ?? fallbackFrame else {
+        case .window(let windowID, _):
+            guard let liveWindow = content.windows.first(where: { $0.windowID == windowID }),
+                  liveWindow.frame.width >= 80,
+                  liveWindow.frame.height >= 80 else {
                 throw RecorderError.windowNotFound
             }
+            let windowFrame = liveWindow.frame
 
             guard let display = displayForCaptureRect(windowFrame, displays: content.displays) else {
                 throw RecorderError.noDisplay
