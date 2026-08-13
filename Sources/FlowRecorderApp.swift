@@ -177,6 +177,8 @@ final class AppModel: ObservableObject {
     摄像头小窗可以拖到角落，用来做教程、演示、课程、作品讲解。
     """
 
+    private static let minimumFreeDiskSpaceBytes: Int64 = 500 * 1_024 * 1_024
+
     var isCountingDown: Bool {
         countdownSeconds != nil
     }
@@ -269,8 +271,16 @@ final class AppModel: ObservableObject {
     func startRecording() async {
         do {
             isBusy = true
-            status = "正在请求屏幕录制权限..."
+            status = "正在做录制前检查..."
+            let captureTarget = currentCaptureTarget
+            try ensureOutputFolderReadyForRecording()
+            try ensureEnoughDiskSpaceForRecording()
+
+            status = "正在检查屏幕录制权限和录制范围..."
+            try await recorder.preflightCaptureAvailability(target: captureTarget)
+
             if includeMicrophone {
+                status = "正在检查麦克风权限..."
                 guard await ensureMicrophonePermissionForRecording() else {
                     isBusy = false
                     return
@@ -281,12 +291,6 @@ final class AppModel: ObservableObject {
 
             status = "正在准备录制..."
             let microphoneDeviceID = includeMicrophone ? selectedMicrophoneDevice?.uniqueID : nil
-            let captureTarget: RecorderCaptureTarget = {
-                if let selectedWindowID {
-                    return .window(id: selectedWindowID, fallbackFrame: selectedWindowFrame)
-                }
-                return .display(rect: selectedCaptureRect)
-            }()
             let url = try await recorder.start(
                 includeSystemAudio: includeSystemAudio,
                 includeMicrophone: includeMicrophone,
@@ -308,6 +312,39 @@ final class AppModel: ObservableObject {
             countdownTask = nil
             status = error is CancellationError ? "已取消倒计时。" : "启动失败：\(humanReadable(error))"
             refreshRecordings()
+        }
+    }
+
+    private var currentCaptureTarget: RecorderCaptureTarget {
+        if let selectedWindowID {
+            return .window(id: selectedWindowID, fallbackFrame: selectedWindowFrame)
+        }
+        return .display(rect: selectedCaptureRect)
+    }
+
+    private func ensureOutputFolderReadyForRecording() throws {
+        let folder = outputFolderURL
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        guard FileManager.default.isWritableFile(atPath: folder.path) else {
+            throw RecorderError.saveFailed("输出目录不可写：\(folder.path)")
+        }
+
+        let testURL = folder.appendingPathComponent(".flowrecorder-write-test-\(UUID().uuidString).tmp")
+        do {
+            try Data("write-test".utf8).write(to: testURL, options: .atomic)
+            try? FileManager.default.removeItem(at: testURL)
+        } catch {
+            try? FileManager.default.removeItem(at: testURL)
+            throw RecorderError.saveFailed("输出目录写入失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func ensureEnoughDiskSpaceForRecording() throws {
+        guard let freeBytes = freeDiskSpaceBytes() else { return }
+        guard freeBytes >= Self.minimumFreeDiskSpaceBytes else {
+            let free = ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+            let minimum = ByteCountFormatter.string(fromByteCount: Self.minimumFreeDiskSpaceBytes, countStyle: .file)
+            throw RecorderError.saveFailed("磁盘剩余空间不足：当前 \(free)，建议至少保留 \(minimum) 后再录制")
         }
     }
 
@@ -470,6 +507,7 @@ final class AppModel: ObservableObject {
             "Output URL: \(outputURL?.path ?? "none")",
             "Output Folder: \(outputFolderURL.path)",
             "Recovery Folder: \(recoveryFolderURL.path)",
+            "Free Disk Space: \(freeDiskSpaceDescription())",
             "",
             "Recent Recordings:"
         ]
@@ -501,6 +539,19 @@ final class AppModel: ObservableObject {
         let size = ByteCountFormatter.string(fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)
         let modified = values?.contentModificationDate.map { "\($0)" } ?? "unknown date"
         return "\(url.lastPathComponent) · \(size) · \(modified)"
+    }
+
+    private func freeDiskSpaceDescription() -> String {
+        guard let freeBytes = freeDiskSpaceBytes() else { return "unknown" }
+        return ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+    }
+
+    private func freeDiskSpaceBytes() -> Int64? {
+        guard let attributes = try? FileManager.default.attributesOfFileSystem(forPath: outputFolderURL.path),
+              let freeSize = attributes[.systemFreeSize] as? NSNumber else {
+            return nil
+        }
+        return freeSize.int64Value
     }
 
     private func diagnosticsLogTail(maxLines: Int) -> String {
@@ -2273,6 +2324,11 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
 
     var hasActiveRecording: Bool {
         stream != nil || recordingOutput != nil
+    }
+
+    func preflightCaptureAvailability(target: RecorderCaptureTarget) async throws {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        _ = try makeCaptureSetup(target: target, content: content)
     }
 
     func start(
