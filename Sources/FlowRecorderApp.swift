@@ -122,6 +122,8 @@ final class AppModel: ObservableObject {
     @Published var outputURL: URL?
     @Published var recentRecordings: [RecordingItem] = []
     @Published private(set) var recoveredInterruptedRecordingURLs: [URL] = []
+    @Published private(set) var recordingHealthItems = RecordingHealthItem.initialItems
+    @Published private(set) var isCheckingRecordingHealth = false
     @Published var includeSystemAudio = true {
         didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
     }
@@ -346,6 +348,123 @@ final class AppModel: ObservableObject {
             let minimum = ByteCountFormatter.string(fromByteCount: Self.minimumFreeDiskSpaceBytes, countStyle: .file)
             throw RecorderError.saveFailed("磁盘剩余空间不足：当前 \(free)，建议至少保留 \(minimum) 后再录制")
         }
+    }
+
+    func refreshRecordingHealth() async {
+        guard !isRecording, !isBusy else { return }
+        isCheckingRecordingHealth = true
+        defer { isCheckingRecordingHealth = false }
+
+        var items = [RecordingHealthItem]()
+
+        do {
+            try ensureOutputFolderReadyForRecording()
+            items.append(RecordingHealthItem(
+                id: "output",
+                title: "输出目录",
+                detail: "可写入",
+                systemImage: "folder.fill",
+                tone: .ok
+            ))
+        } catch {
+            items.append(RecordingHealthItem(
+                id: "output",
+                title: "输出目录",
+                detail: conciseHealthText(humanReadable(error)),
+                systemImage: "folder.fill",
+                tone: .error
+            ))
+        }
+
+        items.append(diskSpaceHealthItem())
+
+        do {
+            try await recorder.preflightCaptureAvailability(target: currentCaptureTarget)
+            items.append(RecordingHealthItem(
+                id: "screen",
+                title: "屏幕录制",
+                detail: captureAreaDescription,
+                systemImage: "display",
+                tone: .ok
+            ))
+        } catch {
+            items.append(RecordingHealthItem(
+                id: "screen",
+                title: "屏幕录制",
+                detail: conciseHealthText(humanReadable(error)),
+                systemImage: "display",
+                tone: .error
+            ))
+        }
+
+        items.append(microphoneHealthItem())
+        recordingHealthItems = items
+    }
+
+    private func diskSpaceHealthItem() -> RecordingHealthItem {
+        guard let freeBytes = freeDiskSpaceBytes() else {
+            return RecordingHealthItem(
+                id: "disk",
+                title: "磁盘空间",
+                detail: "无法读取",
+                systemImage: "internaldrive",
+                tone: .warning
+            )
+        }
+
+        let detail = ByteCountFormatter.string(fromByteCount: freeBytes, countStyle: .file)
+        return RecordingHealthItem(
+            id: "disk",
+            title: "磁盘空间",
+            detail: detail,
+            systemImage: "internaldrive.fill",
+            tone: freeBytes >= Self.minimumFreeDiskSpaceBytes ? .ok : .error
+        )
+    }
+
+    private func microphoneHealthItem() -> RecordingHealthItem {
+        guard includeMicrophone else {
+            return RecordingHealthItem(
+                id: "microphone",
+                title: "麦克风",
+                detail: "关闭",
+                systemImage: "mic.slash.fill",
+                tone: .neutral
+            )
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return RecordingHealthItem(
+                id: "microphone",
+                title: "麦克风",
+                detail: selectedMicrophoneDevice?.name ?? "可录入",
+                systemImage: "mic.fill",
+                tone: .ok
+            )
+        case .notDetermined:
+            return RecordingHealthItem(
+                id: "microphone",
+                title: "麦克风",
+                detail: "开始时请求",
+                systemImage: "mic.fill",
+                tone: .warning
+            )
+        default:
+            return RecordingHealthItem(
+                id: "microphone",
+                title: "麦克风",
+                detail: "未授权",
+                systemImage: "mic.slash.fill",
+                tone: .error
+            )
+        }
+    }
+
+    private func conciseHealthText(_ text: String) -> String {
+        let trimmed = text.replacingOccurrences(of: "视频保存失败：", with: "")
+        guard trimmed.count > 20 else { return trimmed }
+        return "\(trimmed.prefix(20))..."
     }
 
     private func runCountdown() async throws {
@@ -985,6 +1104,52 @@ struct RecordingItem: Identifiable {
     }
 }
 
+enum RecordingHealthTone {
+    case ok
+    case warning
+    case error
+    case neutral
+}
+
+struct RecordingHealthItem: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    let systemImage: String
+    let tone: RecordingHealthTone
+
+    static let initialItems = [
+        RecordingHealthItem(
+            id: "output",
+            title: "输出目录",
+            detail: "待检查",
+            systemImage: "folder.fill",
+            tone: .neutral
+        ),
+        RecordingHealthItem(
+            id: "disk",
+            title: "磁盘空间",
+            detail: "待检查",
+            systemImage: "internaldrive",
+            tone: .neutral
+        ),
+        RecordingHealthItem(
+            id: "screen",
+            title: "屏幕录制",
+            detail: "待检查",
+            systemImage: "display",
+            tone: .neutral
+        ),
+        RecordingHealthItem(
+            id: "microphone",
+            title: "麦克风",
+            detail: "待检查",
+            systemImage: "mic.fill",
+            tone: .neutral
+        )
+    ]
+}
+
 struct MainView: View {
     @ObservedObject var model: AppModel
     @State private var cameraShown = false
@@ -1030,7 +1195,22 @@ struct MainView: View {
             }
         }
         .onAppear {
-            Task { await model.refreshWindowOptions() }
+            Task {
+                await model.refreshWindowOptions()
+                await model.refreshRecordingHealth()
+            }
+        }
+        .onChange(of: model.includeMicrophone) { _, _ in
+            Task { await model.refreshRecordingHealth() }
+        }
+        .onChange(of: model.selectedMicrophoneDeviceID) { _, _ in
+            Task { await model.refreshRecordingHealth() }
+        }
+        .onChange(of: model.selectedWindowID) { _, _ in
+            Task { await model.refreshRecordingHealth() }
+        }
+        .onChange(of: model.selectedCaptureRect) { _, _ in
+            Task { await model.refreshRecordingHealth() }
         }
         .sheet(isPresented: $windowPickerShown) {
             WindowPickerSheet(
@@ -1192,6 +1372,7 @@ struct MainView: View {
         freshPanel {
             VStack(alignment: .leading, spacing: 14) {
                 sectionHeader("录制源", "分清电脑声和人声，方便直接播放和后期处理")
+                recordingHealthPanel
                 VStack(spacing: 0) {
                     sourceToggleCard(title: "系统声音", subtitle: model.includeSystemAudio ? "电脑内部声音" : "关闭", icon: "speaker.wave.2.fill", tint: freshBlue, isOn: $model.includeSystemAudio)
                         .disabled(model.isRecording || model.isBusy)
@@ -1210,6 +1391,101 @@ struct MainView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private var recordingHealthPanel: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Label("录制前检查", systemImage: "checklist.checked")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(ink.opacity(0.82))
+                Spacer()
+                if model.isCheckingRecordingHealth {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.74)
+                }
+                Button {
+                    Task { await model.refreshRecordingHealth() }
+                } label: {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                        .labelStyle(.titleAndIcon)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.semibold))
+                .disabled(model.isRecording || model.isBusy || model.isCheckingRecordingHealth)
+            }
+
+            LazyVGrid(
+                columns: [
+                    GridItem(.flexible(), spacing: 8),
+                    GridItem(.flexible(), spacing: 8)
+                ],
+                spacing: 8
+            ) {
+                ForEach(model.recordingHealthItems) { item in
+                    recordingHealthChip(item)
+                }
+            }
+        }
+        .padding(11)
+        .background(canvas.opacity(0.72), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(panelBorder.opacity(0.72), lineWidth: 1))
+    }
+
+    private func recordingHealthChip(_ item: RecordingHealthItem) -> some View {
+        let tint = recordingHealthColor(item.tone)
+        return HStack(spacing: 8) {
+            Image(systemName: item.systemImage)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 24, height: 24)
+                .background(tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(item.title)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(ink.opacity(0.76))
+                Text(item.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+            Image(systemName: recordingHealthStatusSymbol(item.tone))
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(tint.opacity(item.tone == .neutral ? 0.50 : 0.95))
+        }
+        .padding(.vertical, 7)
+        .padding(.horizontal, 8)
+        .background(surface.opacity(0.78), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(tint.opacity(0.14), lineWidth: 1))
+    }
+
+    private func recordingHealthColor(_ tone: RecordingHealthTone) -> Color {
+        switch tone {
+        case .ok:
+            return freshMint
+        case .warning:
+            return .orange
+        case .error:
+            return .red
+        case .neutral:
+            return .secondary
+        }
+    }
+
+    private func recordingHealthStatusSymbol(_ tone: RecordingHealthTone) -> String {
+        switch tone {
+        case .ok:
+            return "checkmark.circle.fill"
+        case .warning:
+            return "exclamationmark.triangle.fill"
+        case .error:
+            return "xmark.circle.fill"
+        case .neutral:
+            return "circle"
         }
     }
 
