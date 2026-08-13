@@ -848,7 +848,7 @@ final class AppModel: ObservableObject {
         selectedWindowID = nil
         selectedWindowFrame = nil
 
-        guard let screenFrame = NSScreen.main?.frame else {
+        guard let screenFrame = NSScreen.main?.visibleFrame else {
             selectedCaptureRect = nil
             status = "没有找到主屏幕，已恢复为全屏。"
             return
