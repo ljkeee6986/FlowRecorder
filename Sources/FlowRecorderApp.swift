@@ -305,9 +305,28 @@ final class AppModel: ObservableObject {
         return folder
     }
 
+    var diagnosticsLogURL: URL {
+        let file = outputFolderURL.appendingPathComponent("status.txt")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            FileManager.default.createFile(atPath: file.path, contents: nil)
+        }
+        return file
+    }
+
     func openOutputFolder() {
         NSWorkspace.shared.open(outputFolderURL)
         refreshRecordings()
+    }
+
+    func openDiagnosticsLog() {
+        NSWorkspace.shared.open(diagnosticsLogURL)
+    }
+
+    func copyDiagnosticsToClipboard() {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(buildDiagnosticsSnapshot(), forType: .string)
+        status = "诊断信息已复制到剪贴板。"
     }
 
     var selectedMicrophoneDevice: MicrophoneDevice? {
@@ -331,6 +350,58 @@ final class AppModel: ObservableObject {
             return "只录固定区域，适合短视频画幅或局部演示。"
         }
         return "录制主屏幕全屏，最稳妥。"
+    }
+
+    private func buildDiagnosticsSnapshot() -> String {
+        let inProgressFolder = outputFolderURL.appendingPathComponent(".in-progress", isDirectory: true)
+        let inProgressFiles = ((try? FileManager.default.contentsOfDirectory(
+            at: inProgressFolder,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []).map { diagnosticFileLine($0) }
+
+        var lines = [
+            "FlowRecorder Diagnostic",
+            "Generated: \(Date())",
+            "Status: \(status)",
+            "Recording State: isRecording=\(isRecording), isBusy=\(isBusy), isCountingDown=\(isCountingDown)",
+            "Sources: systemAudio=\(includeSystemAudio), microphone=\(includeMicrophone), clickHighlights=\(highlightMouseClicks)",
+            "Capture: \(captureAreaDescription)",
+            "Output Resolution: \(outputResolution.label)",
+            "Output URL: \(outputURL?.path ?? "none")",
+            "Output Folder: \(outputFolderURL.path)",
+            "",
+            "Recent Recordings:"
+        ]
+
+        if recentRecordings.isEmpty {
+            lines.append("- none")
+        } else {
+            lines.append(contentsOf: recentRecordings.map { "- \(diagnosticFileLine($0.url))" })
+        }
+
+        lines.append("")
+        lines.append("In-progress Files:")
+        lines.append(contentsOf: inProgressFiles.isEmpty ? ["- none"] : inProgressFiles.map { "- \($0)" })
+        lines.append("")
+        lines.append("Status Log Tail:")
+        lines.append(diagnosticsLogTail(maxLines: 80))
+        return lines.joined(separator: "\n")
+    }
+
+    private func diagnosticFileLine(_ url: URL) -> String {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let size = ByteCountFormatter.string(fromByteCount: Int64(values?.fileSize ?? 0), countStyle: .file)
+        let modified = values?.contentModificationDate.map { "\($0)" } ?? "unknown date"
+        return "\(url.lastPathComponent) · \(size) · \(modified)"
+    }
+
+    private func diagnosticsLogTail(maxLines: Int) -> String {
+        guard let text = try? String(contentsOf: diagnosticsLogURL, encoding: .utf8) else {
+            return "- status.txt unreadable"
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        return lines.suffix(maxLines).joined(separator: "\n")
     }
 
     var selectedWindowDescription: String {
@@ -1222,6 +1293,8 @@ struct MainView: View {
                 if let url = model.outputURL {
                     Button { NSWorkspace.shared.open(url.deletingLastPathComponent()) } label: { Label("查看文件", systemImage: "folder") }.buttonStyle(.bordered)
                 }
+                Button { model.copyDiagnosticsToClipboard() } label: { Label("复制诊断", systemImage: "doc.on.doc") }.buttonStyle(.bordered)
+                Button { model.openDiagnosticsLog() } label: { Label("日志", systemImage: "doc.text.magnifyingglass") }.buttonStyle(.bordered)
                 if model.status.contains("麦克风") && model.status.contains("权限") {
                     Button { model.openMicrophoneSettings() } label: { Label("麦克风权限", systemImage: "mic") }.buttonStyle(.borderedProminent).tint(.orange)
                 } else if model.status.contains("权限") {
@@ -2131,15 +2204,22 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         var renderedClickCount = 0
         var clickOverlayFailed = false
         var filesToQuarantine = [temporaryOutputURL]
+        appendRecorderNote(
+            "stop begin temp=\(temporaryOutputURL.lastPathComponent) final=\(finalOutputURL.lastPathComponent) crop=\(rectDescription(postCropRect)) resolution=\(outputResolution.label) capturedClicks=\(capturedClickMarkers.count) requiresProcessing=\(requiresProcessing)"
+        )
         do {
             try await finishNativeRecording(stream)
             try await validatePlayableMovie(at: temporaryOutputURL, expectedAudioTracks: 0)
+            appendRecorderNote("native mp4 ready \(fileSummary(temporaryOutputURL))")
 
             var workingURL = temporaryOutputURL
             if requiresProcessing || !capturedClickMarkers.isEmpty {
                 let processedURL = temporaryOutputURL.deletingLastPathComponent()
                     .appendingPathComponent("\(temporaryOutputURL.deletingPathExtension().lastPathComponent)-processed.mp4")
                 filesToQuarantine.append(processedURL)
+                appendRecorderNote(
+                    "postprocess begin output=\(processedURL.lastPathComponent) crop=\(rectDescription(postCropRect)) maxLongEdge=\(outputResolution.maximumLongEdge.map { String(Int($0)) } ?? "native") clicks=\(capturedClickMarkers.count)"
+                )
                 do {
                     renderedClickCount = try await exportProcessedMovie(
                         from: temporaryOutputURL,
@@ -2150,6 +2230,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                     )
                 } catch {
                     guard !capturedClickMarkers.isEmpty else { throw error }
+                    appendRecorderNote("click overlay failed, preserving playable base path: \(saveFailureText(from: error))")
                     clickOverlayFailed = true
                     try? FileManager.default.removeItem(at: processedURL)
                     if requiresProcessing {
@@ -2168,11 +2249,13 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
                 }
                 if FileManager.default.fileExists(atPath: processedURL.path) {
                     try await validatePlayableMovie(at: processedURL, expectedAudioTracks: 0)
+                    appendRecorderNote("postprocess ready \(fileSummary(processedURL)) renderedClicks=\(renderedClickCount) overlayFailed=\(clickOverlayFailed)")
                     workingURL = processedURL
                 }
             }
 
             let savedURL = try commitTemporaryRecording(from: workingURL, to: finalOutputURL)
+            appendRecorderNote("commit complete \(fileSummary(savedURL))")
             for url in filesToQuarantine where url != savedURL {
                 try? FileManager.default.removeItem(at: url)
             }
@@ -2191,6 +2274,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             for url in filesToQuarantine {
                 moved = quarantineBrokenFile(url) ?? moved
             }
+            appendRecorderNote("stop failed message=\(saveFailureText(from: error)) quarantined=\(moved?.path ?? "none")")
             resetAfterStop()
             throw RecorderError.saveFailed(failureMessage(saveFailureText(from: error), moved: moved))
         }
@@ -2877,6 +2961,18 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             return "\(message)。未完成文件已移到：\(moved.path)"
         }
         return message
+    }
+
+    private func fileSummary(_ url: URL) -> String {
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+        let byteCount = Int64(values?.fileSize ?? 0)
+        let size = ByteCountFormatter.string(fromByteCount: byteCount, countStyle: .file)
+        return "file=\(url.lastPathComponent) size=\(size) path=\(url.path)"
+    }
+
+    private func rectDescription(_ rect: CGRect?) -> String {
+        guard let rect else { return "none" }
+        return "\(Int(rect.minX)),\(Int(rect.minY)),\(Int(rect.width))x\(Int(rect.height))"
     }
 
     private func appendRecorderNote(_ message: String) {
