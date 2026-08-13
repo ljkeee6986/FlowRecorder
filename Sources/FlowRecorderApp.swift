@@ -121,6 +121,7 @@ final class AppModel: ObservableObject {
     }
     @Published var outputURL: URL?
     @Published var recentRecordings: [RecordingItem] = []
+    @Published private(set) var recoveredInterruptedRecordingURLs: [URL] = []
     @Published var includeSystemAudio = true {
         didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
     }
@@ -182,10 +183,14 @@ final class AppModel: ObservableObject {
 
     init() {
         loadPersistentSettings()
-        recorder.recoverInterruptedRecordings()
+        recoveredInterruptedRecordingURLs = recorder.recoverInterruptedRecordings()
         refreshMicrophoneDevices()
-        writeStatus(status)
         refreshRecordings()
+        if recoveredInterruptedRecordingURLs.isEmpty {
+            writeStatus(status)
+        } else {
+            status = "已处理上次未完成录屏：\(recoveredInterruptedRecordingURLs.count) 个临时文件已移到隔离目录，不影响新录制。"
+        }
     }
 
     private func persist(_ value: Any, forKey key: String) {
@@ -393,9 +398,23 @@ final class AppModel: ObservableObject {
         return file
     }
 
+    var recoveryFolderURL: URL {
+        let folder = outputFolderURL.appendingPathComponent("损坏录屏", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    var hasRecoveredInterruptedRecordings: Bool {
+        !recoveredInterruptedRecordingURLs.isEmpty
+    }
+
     func openOutputFolder() {
         NSWorkspace.shared.open(outputFolderURL)
         refreshRecordings()
+    }
+
+    func openRecoveryFolder() {
+        NSWorkspace.shared.open(recoveryFolderURL)
     }
 
     func openDiagnosticsLog() {
@@ -450,6 +469,7 @@ final class AppModel: ObservableObject {
             "Output Resolution: \(outputResolution.label)",
             "Output URL: \(outputURL?.path ?? "none")",
             "Output Folder: \(outputFolderURL.path)",
+            "Recovery Folder: \(recoveryFolderURL.path)",
             "",
             "Recent Recordings:"
         ]
@@ -463,6 +483,13 @@ final class AppModel: ObservableObject {
         lines.append("")
         lines.append("In-progress Files:")
         lines.append(contentsOf: inProgressFiles.isEmpty ? ["- none"] : inProgressFiles.map { "- \($0)" })
+        lines.append("")
+        lines.append("Recovered Interrupted Recordings This Launch:")
+        if recoveredInterruptedRecordingURLs.isEmpty {
+            lines.append("- none")
+        } else {
+            lines.append(contentsOf: recoveredInterruptedRecordingURLs.map { "- \(diagnosticFileLine($0))" })
+        }
         lines.append("")
         lines.append("Status Log Tail:")
         lines.append(diagnosticsLogTail(maxLines: 80))
@@ -931,6 +958,9 @@ struct MainView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
+                    if model.hasRecoveredInterruptedRecordings {
+                        recoveryBanner
+                    }
                     HStack(alignment: .top, spacing: 14) {
                         recordingHero.frame(minWidth: 312, maxWidth: 348)
                         VStack(spacing: 14) {
@@ -1362,16 +1392,51 @@ struct MainView: View {
         .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(panelBorder, lineWidth: 1))
     }
 
+    private var recoveryBanner: some View {
+        HStack(spacing: 13) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 38, height: 38)
+                .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("已处理上次未完成录屏")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(ink)
+                Text("\(model.recoveredInterruptedRecordingURLs.count) 个临时文件已移到隔离目录；新录制不受影响。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+            Button { model.openRecoveryFolder() } label: { Label("隔离目录", systemImage: "folder.badge.questionmark") }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            Button { model.copyDiagnosticsToClipboard() } label: { Label("复制诊断", systemImage: "doc.on.doc") }
+                .buttonStyle(.bordered)
+        }
+        .padding(14)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(Color.orange.opacity(0.22), lineWidth: 1))
+    }
+
     private var statusBox: some View {
         freshPanel {
+            let needsAttention = model.status.contains("失败") || model.hasRecoveredInterruptedRecordings
             HStack(spacing: 12) {
-                Image(systemName: model.status.contains("失败") ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-                    .foregroundStyle(model.status.contains("失败") ? .orange : freshMint)
+                Image(systemName: needsAttention ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                    .foregroundStyle(needsAttention ? .orange : freshMint)
                     .font(.system(size: 20, weight: .semibold))
-                Text(model.status).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+                Text(model.status).font(.callout).foregroundStyle(.secondary).lineLimit(3)
                 Spacer()
                 if let url = model.outputURL {
                     Button { NSWorkspace.shared.open(url.deletingLastPathComponent()) } label: { Label("查看文件", systemImage: "folder") }.buttonStyle(.bordered)
+                }
+                if model.hasRecoveredInterruptedRecordings {
+                    Button { model.openRecoveryFolder() } label: { Label("隔离目录", systemImage: "exclamationmark.triangle") }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
                 }
                 Button { model.copyDiagnosticsToClipboard() } label: { Label("复制诊断", systemImage: "doc.on.doc") }.buttonStyle(.bordered)
                 Button { model.openDiagnosticsLog() } label: { Label("日志", systemImage: "doc.text.magnifyingglass") }.buttonStyle(.bordered)
@@ -2429,7 +2494,7 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
         }
     }
 
-    func recoverInterruptedRecordings() {
+    func recoverInterruptedRecordings() -> [URL] {
         let tempFolder = inProgressFolderURL()
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: tempFolder,
@@ -2437,9 +2502,19 @@ final class ScreenRecorder: NSObject, SCRecordingOutputDelegate {
             options: [.skipsHiddenFiles]
         )) ?? []
 
+        var recoveredURLs = [URL]()
         for url in urls where url.pathExtension.lowercased() == "mp4" {
-            _ = quarantineBrokenFile(url)
+            if let recoveredURL = quarantineBrokenFile(url) {
+                recoveredURLs.append(recoveredURL)
+            } else {
+                appendRecorderNote("startup recovery failed file=\(url.path)")
+            }
         }
+
+        if !recoveredURLs.isEmpty {
+            appendRecorderNote("startup recovered interrupted recordings count=\(recoveredURLs.count) files=\(recoveredURLs.map { $0.lastPathComponent }.joined(separator: ","))")
+        }
+        return recoveredURLs
     }
 
     @MainActor
