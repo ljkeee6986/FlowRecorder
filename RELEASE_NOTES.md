@@ -4,6 +4,14 @@
 
 发布日期：2026-08-13
 
+GitHub Release：`https://github.com/ljkeee6986/FlowRecorder/releases/tag/v0.2.0-test`
+
+下载附件：
+
+- `Jack-v0.2.0-macOS-arm64.dmg`
+- `Jack-v0.2.0-macOS-arm64.zip`
+- `SHA256SUMS.txt`
+
 这是当前稳定测试版，核心目标是解决“录完后 MP4 损坏/打不开”的问题，并补齐录制前检查、保存状态、诊断和误退出保护。
 
 ### 关键修复

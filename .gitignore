@@ -3,6 +3,8 @@
 
 # Build outputs
 build/
+dist/
+release-staging/
 *.app/
 *.dSYM/
 
@@ -28,4 +30,3 @@ certs/
 DerivedData/
 *.xcuserdata/
 xcuserdata/
-

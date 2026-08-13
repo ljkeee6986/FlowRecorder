@@ -6,6 +6,8 @@
 
 - 版本：`v0.2.0-test`
 - App 显示版本：`测试版 v0.2.0 (20)`
+- GitHub Release：`https://github.com/ljkeee6986/FlowRecorder/releases/tag/v0.2.0-test`
+- 下载附件：`Jack-v0.2.0-macOS-arm64.dmg` / `Jack-v0.2.0-macOS-arm64.zip`
 - 测试包位置：`/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app`
 - 默认输出目录：`~/Movies/FlowRecorder`
 - 诊断日志：`~/Movies/FlowRecorder/status.txt`
