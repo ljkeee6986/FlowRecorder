@@ -114,6 +114,7 @@ final class AppModel: ObservableObject {
     @Published var isRecording = false
     @Published var isBusy = false
     @Published private(set) var countdownSeconds: Int?
+    @Published private(set) var recordingElapsed = 0
     @Published var status = "准备就绪" {
         didSet { writeStatus(status) }
     }
@@ -140,6 +141,8 @@ final class AppModel: ObservableObject {
 
     private let recorder = ScreenRecorder()
     private var countdownTask: Task<Void, Never>?
+    private var recordingTimer: Timer?
+    private var recordingStartedAt: Date?
 
     var isCountingDown: Bool {
         countdownSeconds != nil
@@ -211,6 +214,8 @@ final class AppModel: ObservableObject {
             isRecording = true
             isBusy = false
             countdownTask = nil
+            beginRecordingTimer()
+            OverlayManager.shared.showRecordingControls(model: self)
             status = "录制中：\(url.lastPathComponent)"
         } catch {
             isRecording = false
@@ -249,14 +254,39 @@ final class AppModel: ObservableObject {
             outputURL = result.url
             isRecording = false
             isBusy = false
+            endRecordingTimer()
+            OverlayManager.shared.hideRecordingControls()
             status = "已保存：\(result.url.lastPathComponent)"
             refreshRecordings()
         } catch {
             isRecording = false
             isBusy = false
+            endRecordingTimer()
+            OverlayManager.shared.hideRecordingControls()
             status = "保存失败：\(humanReadable(error))"
             refreshRecordings()
         }
+    }
+
+    private func beginRecordingTimer() {
+        recordingTimer?.invalidate()
+        recordingStartedAt = Date()
+        recordingElapsed = 0
+        let timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let recordingStartedAt = self.recordingStartedAt else { return }
+                self.recordingElapsed = max(0, Int(Date().timeIntervalSince(recordingStartedAt)))
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        recordingTimer = timer
+    }
+
+    private func endRecordingTimer() {
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        recordingStartedAt = nil
+        recordingElapsed = 0
     }
 
     var outputFolderURL: URL {
@@ -1388,6 +1418,63 @@ struct WindowPickerSheet: View {
         .buttonStyle(.plain)
     }
 }
+struct RecordingControlsView: View {
+    @ObservedObject var model: AppModel
+
+    private var elapsedText: String {
+        String(format: "%02d:%02d", model.recordingElapsed / 60, model.recordingElapsed % 60)
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(Color(red: 1.0, green: 0.27, blue: 0.30))
+                .frame(width: 10, height: 10)
+                .shadow(color: .red.opacity(0.55), radius: 5)
+
+            Text("REC")
+                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .foregroundStyle(.white.opacity(0.70))
+
+            Text(elapsedText)
+                .font(.system(size: 17, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+                .frame(width: 58, alignment: .leading)
+
+            Divider()
+                .frame(height: 20)
+                .overlay(.white.opacity(0.18))
+
+            Image(systemName: model.includeSystemAudio ? "speaker.wave.2.fill" : "speaker.slash.fill")
+                .foregroundStyle(model.includeSystemAudio ? Color(red: 0.25, green: 0.72, blue: 1.0) : .white.opacity(0.35))
+                .accessibilityLabel(model.includeSystemAudio ? "系统声音开启" : "系统声音关闭")
+
+            Image(systemName: model.includeMicrophone ? "mic.fill" : "mic.slash.fill")
+                .foregroundStyle(model.includeMicrophone ? Color(red: 1.0, green: 0.48, blue: 0.59) : .white.opacity(0.35))
+                .accessibilityLabel(model.includeMicrophone ? "麦克风开启" : "麦克风关闭")
+
+            Spacer(minLength: 2)
+
+            Button {
+                Task { await model.stopRecording() }
+            } label: {
+                Image(systemName: "stop.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(Color(red: 0.12, green: 0.13, blue: 0.16))
+                    .frame(width: 30, height: 30)
+                    .background(.white, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .disabled(model.isBusy || !model.isRecording)
+            .help("停止录制")
+        }
+        .padding(.horizontal, 13)
+        .frame(width: 360, height: 52)
+        .background(Color(red: 0.07, green: 0.08, blue: 0.10), in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).stroke(.white.opacity(0.14), lineWidth: 1))
+    }
+}
+
 final class OverlayManager {
     static let shared = OverlayManager()
 
@@ -1395,6 +1482,40 @@ final class OverlayManager {
     private var teleprompterWindow: NSWindow?
     private var teleprompterHost: NSHostingView<TeleprompterOverlayView>?
     private var regionSelectionWindow: NSWindow?
+    private var recordingControlsWindow: NSPanel?
+
+    func showRecordingControls(model: AppModel) {
+        if let recordingControlsWindow {
+            recordingControlsWindow.contentView = NSHostingView(rootView: RecordingControlsView(model: model))
+            recordingControlsWindow.orderFrontRegardless()
+            return
+        }
+
+        let content = NSHostingView(rootView: RecordingControlsView(model: model))
+        let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 200, y: 700, width: 1000, height: 200)
+        let panel = NSPanel(
+            contentRect: NSRect(x: screenFrame.midX - 180, y: screenFrame.maxY - 74, width: 360, height: 52),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.contentView = content
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .floating
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        panel.isMovableByWindowBackground = true
+        panel.hidesOnDeactivate = false
+        panel.animationBehavior = .none
+        panel.sharingType = .none
+        panel.orderFrontRegardless()
+        recordingControlsWindow = panel
+    }
+
+    func hideRecordingControls() {
+        recordingControlsWindow?.orderOut(nil)
+    }
 
     func showCamera() {
         if cameraWindow != nil {
