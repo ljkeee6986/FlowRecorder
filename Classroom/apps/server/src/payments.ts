@@ -24,7 +24,7 @@ class DisabledPaymentProvider implements PaymentProvider {
   constructor(readonly name: PaymentProviderName) {}
 
   async createPayment(): Promise<PaymentIntent> {
-    throw new Error(`${this.name} payment is reserved but disabled in Classroom 0.1`);
+    throw new Error(`${this.name} payment is reserved but disabled in Classroom 0.2`);
   }
 
   async verifyNotification(): Promise<string> {

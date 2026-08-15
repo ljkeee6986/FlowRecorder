@@ -93,6 +93,7 @@ export interface MediaGrant {
   userId: string;
   canPublishAudio: boolean;
   canPublishVideo: boolean;
+  canPublishScreen: boolean;
   expiresAt: string;
   sdkAppId?: number;
   userSig?: string;

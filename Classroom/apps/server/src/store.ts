@@ -12,14 +12,73 @@ import type {
 
 const shareCode = customAlphabet("23456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", 14);
 
+export interface ClassroomState {
+  version: 1;
+  rooms: LiveRoom[];
+  participants: Participant[];
+  messages: ChatMessage[];
+  replays: Replay[];
+}
+
 export class ClassroomStore {
   private readonly rooms = new Map<string, LiveRoom>();
   private readonly participants = new Map<string, Participant>();
   private readonly messages = new Map<string, ChatMessage[]>();
   private readonly replays = new Map<string, Replay[]>();
+  private onMutation?: () => void;
 
   constructor(seedDemo = true) {
     if (seedDemo) this.createRoom("PPT 实战公开课");
+  }
+
+  setMutationListener(listener: (() => void) | undefined): void {
+    this.onMutation = listener;
+  }
+
+  restore(state: ClassroomState): void {
+    if (state.version !== 1) throw new Error(`Unsupported classroom state version: ${state.version}`);
+    this.rooms.clear();
+    this.participants.clear();
+    this.messages.clear();
+    this.replays.clear();
+
+    for (const room of state.rooms) {
+      const restoredRoom: LiveRoom = room.status === "live"
+        ? { ...room, status: "scheduled", startedAt: undefined, endedAt: undefined }
+        : room;
+      this.rooms.set(room.id, structuredClone(restoredRoom));
+      this.messages.set(room.id, []);
+      this.replays.set(room.id, []);
+    }
+    for (const participant of state.participants) {
+      const restored: Participant = {
+        ...participant,
+        state: participant.state === "kicked" ? "kicked" : "left",
+        role: participant.role === "cohost" ? "viewer" : participant.role,
+        handRaisedAt: undefined
+      };
+      this.participants.set(restored.id, restored);
+    }
+    for (const message of state.messages) {
+      const roomMessages = this.messages.get(message.roomId) ?? [];
+      roomMessages.push(structuredClone(message));
+      this.messages.set(message.roomId, roomMessages.slice(-100));
+    }
+    for (const replay of state.replays) {
+      const roomReplays = this.replays.get(replay.roomId) ?? [];
+      roomReplays.push(structuredClone(replay));
+      this.replays.set(replay.roomId, roomReplays);
+    }
+  }
+
+  exportState(): ClassroomState {
+    return structuredClone({
+      version: 1,
+      rooms: [...this.rooms.values()],
+      participants: [...this.participants.values()],
+      messages: [...this.messages.values()].flat(),
+      replays: [...this.replays.values()].flat()
+    });
   }
 
   createRoom(title: string): LiveRoom {
@@ -44,6 +103,7 @@ export class ClassroomStore {
     this.rooms.set(room.id, room);
     this.messages.set(room.id, []);
     this.replays.set(room.id, []);
+    this.changed();
     return structuredClone(room);
   }
 
@@ -88,6 +148,7 @@ export class ClassroomStore {
       settings: { ...room.settings, ...patch.settings }
     };
     this.rooms.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -102,6 +163,7 @@ export class ClassroomStore {
       endedAt: status === "ended" ? now : undefined
     };
     this.rooms.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -110,14 +172,16 @@ export class ClassroomStore {
     if (!room) return undefined;
     const updated = { ...room, shareCode: shareCode() };
     this.rooms.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
-  joinRoom(roomId: string, deviceId: string, nickname: string): Participant {
+  joinRoom(roomId: string, deviceId: string, nickname: string): Participant | undefined {
     const existing = [...this.participants.values()].find(
       (participant) => participant.roomId === roomId && participant.deviceId === deviceId
     );
     if (existing) {
+      if (existing.state === "kicked") return undefined;
       const updated: Participant = {
         ...existing,
         nickname,
@@ -126,6 +190,7 @@ export class ClassroomStore {
         handRaisedAt: undefined
       };
       this.participants.set(updated.id, updated);
+      this.changed();
       return structuredClone(updated);
     }
 
@@ -140,6 +205,7 @@ export class ClassroomStore {
       joinedAt: new Date().toISOString()
     };
     this.participants.set(participant.id, participant);
+    this.changed();
     return structuredClone(participant);
   }
 
@@ -151,8 +217,14 @@ export class ClassroomStore {
   setParticipantConnected(id: string, connected: boolean): Participant | undefined {
     const participant = this.participants.get(id);
     if (!participant || participant.state === "kicked") return participant ? structuredClone(participant) : undefined;
-    const updated = { ...participant, state: connected ? "connected" : "left" } as Participant;
+    const updated: Participant = {
+      ...participant,
+      state: connected ? "connected" : "left",
+      role: !connected && participant.role === "cohost" ? "viewer" : participant.role,
+      handRaisedAt: !connected ? undefined : participant.handRaisedAt
+    };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -162,6 +234,7 @@ export class ClassroomStore {
     if (!participant || !room?.settings.allowHandRaise || participant.state === "kicked") return undefined;
     const updated = { ...participant, handRaisedAt: raised ? new Date().toISOString() : undefined };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -172,6 +245,7 @@ export class ClassroomStore {
     if (!room?.settings.allowCohost || this.activeCohost(room.id)) return undefined;
     const updated: Participant = { ...participant, role: "cohost", handRaisedAt: undefined };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -180,6 +254,7 @@ export class ClassroomStore {
     if (!participant) return undefined;
     const updated: Participant = { ...participant, role: "viewer", handRaisedAt: undefined };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -188,6 +263,7 @@ export class ClassroomStore {
     if (!participant) return undefined;
     const updated = { ...participant, muted };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -196,6 +272,7 @@ export class ClassroomStore {
     if (!participant) return undefined;
     const updated: Participant = { ...participant, state: "kicked", role: "viewer", handRaisedAt: undefined };
     this.participants.set(id, updated);
+    this.changed();
     return structuredClone(updated);
   }
 
@@ -215,6 +292,7 @@ export class ClassroomStore {
     const messages = this.messages.get(roomId) ?? [];
     messages.push(message);
     this.messages.set(roomId, messages.slice(-100));
+    this.changed();
     return structuredClone(message);
   }
 
@@ -234,6 +312,7 @@ export class ClassroomStore {
     const replays = this.replays.get(roomId) ?? [];
     replays.unshift(replay);
     this.replays.set(roomId, replays);
+    this.changed();
     return structuredClone(replay);
   }
 
@@ -270,5 +349,9 @@ export class ClassroomStore {
       (participant) => participant.roomId === roomId && participant.state === "connected"
     ).length;
     return Math.round(room.heatBase + online * room.heatMultiplier);
+  }
+
+  private changed(): void {
+    this.onMutation?.();
   }
 }

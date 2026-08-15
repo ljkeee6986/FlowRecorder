@@ -54,6 +54,7 @@ export function createSocketServer(httpServer: HttpServer, store: ClassroomStore
 
   io.on("connection", (socket: ClassroomSocket) => {
     const { session, roomId } = socket.data;
+    const recentChatMessages: number[] = [];
     socket.join(roomChannel(roomId));
 
     if (session.kind === "participant") {
@@ -81,6 +82,14 @@ export function createSocketServer(httpServer: HttpServer, store: ClassroomStore
         acknowledgement?.(false);
         return;
       }
+      const now = Date.now();
+      while (recentChatMessages.length && recentChatMessages[0] < now - 10_000) recentChatMessages.shift();
+      if (recentChatMessages.length >= 8) {
+        socket.emit("system:error", "消息发送太快，请稍后再发");
+        acknowledgement?.(false);
+        return;
+      }
+      recentChatMessages.push(now);
       const message = store.addMessage(roomId, session.participantId, body);
       if (!message) {
         socket.emit("system:error", "当前无法发送消息，请检查是否被禁言");
@@ -119,7 +128,7 @@ export function createSocketServer(httpServer: HttpServer, store: ClassroomStore
         return;
       }
       try {
-        const grant = await mediaProvider.createGrant(participant, true);
+        const grant = await mediaProvider.createGrant(participant, "cohost");
         io.to(participantChannel(participant.id)).emit("cohost:approved", grant);
         io.to(roomChannel(roomId)).emit("participant:updated", participant);
         broadcastSnapshot(io, store, roomId);

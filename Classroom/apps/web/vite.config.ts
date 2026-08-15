@@ -4,6 +4,10 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   plugins: [react()],
   publicDir: "../../../AppIcon.iconset",
+  build: {
+    // TRTC is a separate lazy chunk; keep the normal application bundle under the default-sized budget.
+    chunkSizeWarningLimit: 1200
+  },
   server: {
     proxy: {
       "/api": "http://localhost:4100",

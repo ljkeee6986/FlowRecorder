@@ -30,6 +30,7 @@ import { useParams } from "react-router-dom";
 import { io, type Socket } from "socket.io-client";
 import { api } from "./api";
 import { Stage } from "./Stage";
+import { ClassroomTrtcClient } from "./trtcClient";
 import { classroomDeviceId, formatClock, statusLabel } from "./utils";
 
 type ClassroomSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -45,12 +46,20 @@ export function ViewerPage() {
   const [handRaised, setHandRaised] = useState(false);
   const [cohostGrant, setCohostGrant] = useState<MediaGrant | null>(null);
   const [mediaStream, setMediaStream] = useState<MediaStream | null>(null);
+  const [trtcPublishing, setTrtcPublishing] = useState(false);
+  const [remoteScreenActive, setRemoteScreenActive] = useState(false);
+  const [remoteCameraActive, setRemoteCameraActive] = useState(false);
   const [connected, setConnected] = useState(navigator.onLine);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [joining, setJoining] = useState(false);
   const [socket, setSocket] = useState<ClassroomSocket | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const remoteScreenViewRef = useRef<HTMLDivElement>(null);
+  const remoteCameraViewRef = useRef<HTMLDivElement>(null);
+  const localTrtcViewRef = useRef<HTMLDivElement>(null);
+  const trtcClientRef = useRef<ClassroomTrtcClient | null>(null);
   const messageEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -86,6 +95,8 @@ export function ViewerPage() {
     nextSocket.on("cohost:approved", setCohostGrant);
     nextSocket.on("cohost:revoked", (reason) => {
       stopLocalMedia();
+      void trtcClientRef.current?.demote();
+      setTrtcPublishing(false);
       setCohostGrant(null);
       setError(reason);
     });
@@ -95,6 +106,37 @@ export function ViewerPage() {
     return () => {
       nextSocket.disconnect();
       setSocket(null);
+    };
+  }, [session]);
+
+  useEffect(() => {
+    if (session?.media.provider !== "trtc") return;
+    const client = new ClassroomTrtcClient(
+      {
+        screen: () => remoteScreenViewRef.current,
+        camera: () => remoteCameraViewRef.current,
+        localCohost: () => localTrtcViewRef.current
+      },
+      {
+        onError: setError,
+        onConnection: setConnected,
+        onRemoteVideo: (kind, available) => {
+          if (kind === "screen") setRemoteScreenActive(available);
+          else setRemoteCameraActive(available);
+        }
+      }
+    );
+    trtcClientRef.current = client;
+    void client.enter(session.media).catch((mediaError) => {
+      setConnected(false);
+      setError(mediaError instanceof Error ? mediaError.message : "音视频课堂连接失败");
+    });
+    return () => {
+      void client.close();
+      if (trtcClientRef.current === client) trtcClientRef.current = null;
+      setRemoteScreenActive(false);
+      setRemoteCameraActive(false);
+      setTrtcPublishing(false);
     };
   }, [session]);
 
@@ -114,9 +156,9 @@ export function ViewerPage() {
     return () => {
       window.removeEventListener("online", online);
       window.removeEventListener("offline", offline);
-      mediaStream?.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, [mediaStream]);
+  }, []);
 
   async function join(event: React.FormEvent) {
     event.preventDefault();
@@ -155,16 +197,27 @@ export function ViewerPage() {
 
   async function startLocalMedia() {
     try {
+      if (cohostGrant?.provider === "trtc") {
+        const client = trtcClientRef.current;
+        if (!client) throw new Error("音视频课堂仍在连接，请稍后重试");
+        await client.promote(cohostGrant);
+        setTrtcPublishing(true);
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: { facingMode: "user" } });
+      mediaStreamRef.current = stream;
       setMediaStream(stream);
       if (videoRef.current) videoRef.current.srcObject = stream;
-    } catch {
-      setError("摄像头或麦克风未授权，请在微信或浏览器设置中允许");
+    } catch (mediaError) {
+      setError(mediaError instanceof Error && mediaError.message
+        ? mediaError.message
+        : "摄像头或麦克风未授权，请在微信或浏览器设置中允许");
     }
   }
 
   function stopLocalMedia() {
-    mediaStream?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
     setMediaStream(null);
     if (videoRef.current) videoRef.current.srcObject = null;
   }
@@ -201,11 +254,21 @@ export function ViewerPage() {
 
       <div className="viewer-layout">
         <section className="viewer-video-column">
-          <Stage room={room} localVideoRef={mediaStream ? videoRef : undefined} cohostName={session.participant.nickname} />
-          {cohostGrant && !mediaStream && (
+          <Stage
+            room={room}
+            localVideoRef={mediaStream ? videoRef : undefined}
+            localTrtcViewRef={cohostGrant?.provider === "trtc" ? localTrtcViewRef : undefined}
+            localTrtcVisible={trtcPublishing}
+            remoteScreenViewRef={session.media.provider === "trtc" ? remoteScreenViewRef : undefined}
+            remoteCameraViewRef={session.media.provider === "trtc" ? remoteCameraViewRef : undefined}
+            remoteScreenActive={remoteScreenActive}
+            remoteCameraActive={remoteCameraActive}
+            cohostName={session.participant.nickname}
+          />
+          {cohostGrant && !mediaStream && !trtcPublishing && (
             <div className="cohost-approved"><div><Video size={19} /><span><strong>讲师已同意连麦</strong><small>开启后你的画面和声音将进入课堂</small></span></div><button onClick={() => void startLocalMedia()}>开启摄像头和麦克风</button></div>
           )}
-          {mediaStream && <div className="cohost-active"><span><Mic size={16} />连麦进行中</span><span><Video size={16} />摄像头已开启</span></div>}
+          {(mediaStream || trtcPublishing) && <div className="cohost-active"><span><Mic size={16} />连麦进行中</span><span><Video size={16} />摄像头已开启</span></div>}
           <div className="viewer-actions">
             <button className={handRaised ? "active" : ""} onClick={toggleHand} disabled={!room.settings.allowHandRaise}><Hand size={20} />{handRaised ? "取消举手" : "举手连麦"}</button>
             <button onClick={() => document.querySelector(".viewer-chat")?.scrollIntoView({ behavior: "smooth" })}><MessageCircle size={20} />课堂讨论</button>

@@ -28,11 +28,12 @@ import {
   Video,
   Wifi
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io, type Socket } from "socket.io-client";
 import type { ClientToServerEvents, ServerToClientEvents } from "@flowrecorder/contracts";
 import { api, ApiError } from "./api";
 import { Stage } from "./Stage";
+import { TeacherTrtcClient } from "./trtcClient";
 import { copyText, formatClock, statusLabel } from "./utils";
 
 type ClassroomSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
@@ -41,7 +42,7 @@ type Section = "record" | "classroom" | "replays" | "settings";
 const tokenKey = "flowrecorder.classroom.teacherToken";
 
 function Login({ onLogin }: { onLogin: (token: string) => void }) {
-  const [accessCode, setAccessCode] = useState("jack-demo");
+  const [accessCode, setAccessCode] = useState(import.meta.env.DEV ? "jack-demo" : "");
   const [nickname, setNickname] = useState("Jack 讲师");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -74,7 +75,7 @@ function Login({ onLogin }: { onLogin: (token: string) => void }) {
           {error && <div className="inline-error">{error}</div>}
           <button className="primary-button wide" disabled={busy}>{busy ? "正在进入..." : "进入控制台"}</button>
         </form>
-        <div className="secure-note"><ShieldCheck size={16} />本地测试环境 · 正式部署后更换独立口令</div>
+        <div className="secure-note"><ShieldCheck size={16} />{import.meta.env.DEV ? "本地测试环境 · 正式部署后更换独立口令" : "安全讲师登录"}</div>
       </section>
     </main>
   );
@@ -94,6 +95,10 @@ export function TeacherPage() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [teacherMediaActive, setTeacherMediaActive] = useState(false);
+  const teacherScreenViewRef = useRef<HTMLDivElement>(null);
+  const teacherCameraViewRef = useRef<HTMLDivElement>(null);
+  const teacherTrtcRef = useRef<TeacherTrtcClient | null>(null);
 
   const selectedRoom = snapshot?.room ?? rooms.find((room) => room.id === selectedRoomId);
 
@@ -139,6 +144,11 @@ export function TeacherPage() {
     };
   }, [selectedRoomId, token]);
 
+  useEffect(() => () => {
+    void teacherTrtcRef.current?.stop();
+    teacherTrtcRef.current = null;
+  }, []);
+
   const connectedParticipants = useMemo(
     () => snapshot?.participants.filter((participant) => participant.state === "connected") ?? [],
     [snapshot]
@@ -168,11 +178,34 @@ export function TeacherPage() {
     if (!selectedRoom) return;
     setBusy(true);
     try {
+      if (action === "start") {
+        const { media } = await api.teacherMediaGrant(token, selectedRoom.id);
+        if (media.provider === "trtc") {
+          const client = new TeacherTrtcClient(
+            { screen: () => teacherScreenViewRef.current, camera: () => teacherCameraViewRef.current },
+            setError
+          );
+          teacherTrtcRef.current = client;
+          await client.start(media, selectedRoom.settings.resolution);
+          setTeacherMediaActive(true);
+        }
+      } else {
+        await teacherTrtcRef.current?.stop();
+        teacherTrtcRef.current = null;
+        setTeacherMediaActive(false);
+      }
       const result = await api.setRoomStatus(token, selectedRoom.id, action);
       setSnapshot((current) => current ? { ...current, room: result.room } : current);
       setRooms((current) => current.map((room) => room.id === result.room.id ? result.room : room));
-      flash(action === "start" ? "课堂已开播" : "课堂已结束，本地录像可继续保存");
+      flash(action === "start"
+        ? selectedRoom.settings.localRecording ? "课堂已开播，请确认录屏大师Jack正在录制" : "课堂已开播"
+        : "课堂已结束，本地录像可继续保存");
     } catch (requestError) {
+      if (action === "start") {
+        await teacherTrtcRef.current?.stop();
+        teacherTrtcRef.current = null;
+        setTeacherMediaActive(false);
+      }
       setError(requestError instanceof Error ? requestError.message : "操作失败");
     } finally {
       setBusy(false);
@@ -288,7 +321,14 @@ export function TeacherPage() {
                 <div><span className={`status-dot ${selectedRoom.status}`} /> <strong>{statusLabel(selectedRoom.status)}</strong><span>{selectedRoom.settings.resolution.toUpperCase()} · 30 FPS</span></div>
                 <button className="icon-button" title="刷新" aria-label="刷新" onClick={() => void loadRoom()}><RefreshCw size={16} /></button>
               </div>
-              <Stage room={selectedRoom} teacher />
+              <Stage
+                room={selectedRoom}
+                teacher
+                remoteScreenViewRef={teacherScreenViewRef}
+                remoteCameraViewRef={teacherCameraViewRef}
+                remoteScreenActive={teacherMediaActive}
+                remoteCameraActive={teacherMediaActive}
+              />
               <div className="broadcast-controls">
                 <div className="source-status"><MonitorUp size={18} /><div><strong>主屏幕</strong><span>屏幕与系统声音</span></div></div>
                 <div className="source-status"><Video size={18} /><div><strong>摄像头</strong><span>独立小窗</span></div></div>
@@ -311,7 +351,7 @@ export function TeacherPage() {
                   <Toggle label="聊天" checked={selectedRoom.settings.allowChat} onChange={(checked) => void updateRoom({ settings: { allowChat: checked } })} />
                   <Toggle label="举手" checked={selectedRoom.settings.allowHandRaise} onChange={(checked) => void updateRoom({ settings: { allowHandRaise: checked } })} />
                   <Toggle label="允许连麦" checked={selectedRoom.settings.allowCohost} onChange={(checked) => void updateRoom({ settings: { allowCohost: checked } })} />
-                  <Toggle label="本地录像" checked={selectedRoom.settings.localRecording} onChange={(checked) => void updateRoom({ settings: { localRecording: checked } })} />
+                  <Toggle label="同步本地录像" checked={selectedRoom.settings.localRecording} onChange={(checked) => void updateRoom({ settings: { localRecording: checked } })} />
                 </div>
               </section>
             </section>

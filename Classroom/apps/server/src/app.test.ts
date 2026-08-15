@@ -29,6 +29,13 @@ describe("classroom API", () => {
     expect(joined.body.participant.nickname).toBe("小明");
     expect(joined.body.media.provider).toBe("mock");
     expect(joined.body.media.canPublishAudio).toBe(false);
+    expect(joined.body.media.canPublishScreen).toBe(false);
+
+    const teacherGrant = await request(server.app)
+      .post(`/api/rooms/${created.body.room.id}/media-grant`)
+      .set("Authorization", `Bearer ${token}`)
+      .expect(200);
+    expect(teacherGrant.body.media.canPublishScreen).toBe(true);
     server.io.close();
   });
 
@@ -59,12 +66,24 @@ describe("classroom API", () => {
   it("allows only one active student cohost", () => {
     const store = new ClassroomStore();
     const room = store.listRooms()[0];
-    const first = store.joinRoom(room.id, "cohost-device-1", "小明");
-    const second = store.joinRoom(room.id, "cohost-device-2", "小红");
+    const first = store.joinRoom(room.id, "cohost-device-1", "小明")!;
+    const second = store.joinRoom(room.id, "cohost-device-2", "小红")!;
 
     expect(store.approveCohost(first.id)?.role).toBe("cohost");
     expect(store.approveCohost(second.id)).toBeUndefined();
     expect(store.revokeCohost(first.id)?.role).toBe("viewer");
     expect(store.approveCohost(second.id)?.role).toBe("cohost");
+  });
+
+  it("does not restore cohost rights after disconnect and blocks kicked devices", () => {
+    const store = new ClassroomStore();
+    const room = store.listRooms()[0];
+    const participant = store.joinRoom(room.id, "blocked-device", "小明")!;
+
+    expect(store.approveCohost(participant.id)?.role).toBe("cohost");
+    expect(store.setParticipantConnected(participant.id, false)?.role).toBe("viewer");
+    expect(store.setParticipantConnected(participant.id, true)?.role).toBe("viewer");
+    expect(store.kickParticipant(participant.id)?.state).toBe("kicked");
+    expect(store.joinRoom(room.id, "blocked-device", "重新进入")).toBeUndefined();
   });
 });

@@ -1,4 +1,4 @@
-import type { JoinRoomResponse, LiveRoom, PublicRoom, Replay, RoomSnapshot } from "@flowrecorder/contracts";
+import type { JoinRoomResponse, LiveRoom, MediaGrant, PublicRoom, Replay, RoomSnapshot } from "@flowrecorder/contracts";
 
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
@@ -47,6 +47,9 @@ export const api = {
   },
   setRoomStatus(token: string, roomId: string, action: "start" | "end") {
     return request<{ room: LiveRoom }>(`/api/rooms/${roomId}/${action}`, { method: "POST" }, token);
+  },
+  teacherMediaGrant(token: string, roomId: string) {
+    return request<{ media: MediaGrant }>(`/api/rooms/${roomId}/media-grant`, { method: "POST" }, token);
   },
   regenerateLink(token: string, roomId: string) {
     return request<{ room: LiveRoom; watchUrl: string }>(`/api/rooms/${roomId}/regenerate-link`, { method: "POST" }, token);

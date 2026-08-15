@@ -1,6 +1,7 @@
 import { createServer, type Server as HttpServer } from "node:http";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
+import { rateLimit } from "express-rate-limit";
 import { z } from "zod";
 import { config } from "./config.js";
 import { requireTeacher, signSession } from "./auth.js";
@@ -14,6 +15,22 @@ const roomSettingsSchema = z.object({
   allowCohost: z.boolean().optional(),
   localRecording: z.boolean().optional(),
   resolution: z.enum(["540p", "720p", "1080p"]).optional()
+});
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "登录尝试过于频繁，请稍后再试" }
+});
+
+const joinLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 240,
+  standardHeaders: "draft-8",
+  legacyHeaders: false,
+  message: { error: "进入课堂请求过于频繁，请稍后再试" }
 });
 
 function notFound(res: Response, message = "未找到课堂"): void {
@@ -32,25 +49,26 @@ export interface ClassroomServer {
   store: ClassroomStore;
 }
 
-export function createClassroomServer(store = new ClassroomStore()): ClassroomServer {
+export function createClassroomServer(store = new ClassroomStore(), persistenceName: "memory" | "file" | "postgres" = "memory"): ClassroomServer {
   const app = express();
   const httpServer = createServer(app);
   const io = createSocketServer(httpServer, store);
 
+  if (config.isProduction) app.set("trust proxy", 1);
   app.use(cors({ origin: config.isProduction ? config.webOrigin : true, credentials: true }));
   app.use(express.json({ limit: "1mb" }));
 
   app.get("/api/health", (_req, res) => {
     res.json({
       ok: true,
-      version: "0.1.0",
+      version: "0.2.0",
       mediaProvider: mediaProvider.name,
       paymentsEnabled: config.paymentsEnabled,
-      persistence: "memory"
+      persistence: persistenceName
     });
   });
 
-  app.post("/api/teacher/session", (req, res) => {
+  app.post("/api/teacher/session", loginLimiter, (req, res) => {
     const parsed = z.object({ accessCode: z.string().min(1), nickname: z.string().trim().min(1).max(30).default("Jack 讲师") }).safeParse(req.body);
     if (!parsed.success || parsed.data.accessCode !== config.teacherAccessCode) {
       res.status(401).json({ error: "讲师口令不正确" });
@@ -114,6 +132,14 @@ export function createClassroomServer(store = new ClassroomStore()): ClassroomSe
     res.json({ room });
   });
 
+  app.post("/api/rooms/:id/media-grant", requireTeacher, async (req, res) => {
+    const room = store.getRoom(pathParam(req, "id"));
+    if (!room) return notFound(res);
+    const teacherId = req.session?.kind === "teacher" ? req.session.teacherId : "owner";
+    const media = await mediaProvider.createGrant({ id: teacherId, roomId: room.id }, "teacher");
+    res.json({ media });
+  });
+
   app.post("/api/rooms/:id/regenerate-link", requireTeacher, (req, res) => {
     const room = store.regenerateShareCode(pathParam(req, "id"));
     if (!room) return notFound(res);
@@ -142,7 +168,7 @@ export function createClassroomServer(store = new ClassroomStore()): ClassroomSe
     res.json({ room });
   });
 
-  app.post("/api/live/:shareCode/join", async (req, res) => {
+  app.post("/api/live/:shareCode/join", joinLimiter, async (req, res) => {
     const parsed = z.object({
       deviceId: z.string().min(8).max(100),
       nickname: z.string().trim().min(1).max(24)
@@ -154,8 +180,12 @@ export function createClassroomServer(store = new ClassroomStore()): ClassroomSe
     const room = store.getRoomByShareCode(pathParam(req, "shareCode"));
     if (!room) return notFound(res, "课堂链接无效或已更新");
     const participant = store.joinRoom(room.id, parsed.data.deviceId, parsed.data.nickname);
+    if (!participant) {
+      res.status(403).json({ error: "该设备已被讲师移出课堂" });
+      return;
+    }
     const token = signSession({ kind: "participant", roomId: room.id, participantId: participant.id, role: participant.role });
-    const media = await mediaProvider.createGrant(participant, false);
+    const media = await mediaProvider.createGrant(participant, "viewer");
     res.json({
       room: store.publicRoom(room.shareCode),
       participant,

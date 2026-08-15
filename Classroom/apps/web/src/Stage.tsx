@@ -7,10 +7,27 @@ interface StageProps {
   room: LiveRoom | PublicRoom;
   teacher?: boolean;
   localVideoRef?: RefObject<HTMLVideoElement | null>;
+  localTrtcViewRef?: RefObject<HTMLDivElement | null>;
+  localTrtcVisible?: boolean;
+  remoteScreenViewRef?: RefObject<HTMLDivElement | null>;
+  remoteCameraViewRef?: RefObject<HTMLDivElement | null>;
+  remoteScreenActive?: boolean;
+  remoteCameraActive?: boolean;
   cohostName?: string;
 }
 
-export function Stage({ room, teacher = false, localVideoRef, cohostName }: StageProps) {
+export function Stage({
+  room,
+  teacher = false,
+  localVideoRef,
+  localTrtcViewRef,
+  localTrtcVisible = false,
+  remoteScreenViewRef,
+  remoteCameraViewRef,
+  remoteScreenActive = false,
+  remoteCameraActive = false,
+  cohostName
+}: StageProps) {
   const stageRef = useRef<HTMLDivElement>(null);
   const isLive = room.status === "live";
 
@@ -42,16 +59,26 @@ export function Stage({ room, teacher = false, localVideoRef, cohostName }: Stag
         <div className="slide-corner">JACK CLASSROOM</div>
       </div>
 
+      {remoteScreenViewRef && <div ref={remoteScreenViewRef} className={`trtc-screen-view ${remoteScreenActive ? "active" : ""}`} />}
+
       <div className="teacher-camera">
         <div className="camera-portrait">
           <img src="/icon_128x128.png" alt="讲师" />
         </div>
+        {remoteCameraViewRef && <div ref={remoteCameraViewRef} className={`trtc-camera-view ${remoteCameraActive ? "active" : ""}`} />}
         <div className="camera-label"><span />Jack 讲师</div>
       </div>
 
       {localVideoRef && (
         <div className="cohost-camera">
           <video ref={localVideoRef} muted playsInline autoPlay />
+          <div className="camera-label"><span />{cohostName ?? "连麦中"}</div>
+        </div>
+      )}
+
+      {localTrtcViewRef && (
+        <div className={`cohost-camera ${localTrtcVisible ? "" : "trtc-pending"}`}>
+          <div ref={localTrtcViewRef} className="trtc-local-view" />
           <div className="camera-label"><span />{cohostName ?? "连麦中"}</div>
         </div>
       )}
