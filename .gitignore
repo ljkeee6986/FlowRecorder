@@ -7,6 +7,16 @@ dist/
 release-staging/
 *.app/
 *.dSYM/
+Classroom/node_modules/
+Classroom/**/node_modules/
+Classroom/**/dist/
+Classroom/.env
+Classroom/.data/
+Classroom/.playwright-cli/
+Classroom/output/
+Classroom/**/*.tsbuildinfo
+Classroom/apps/web/vite.config.js
+Classroom/apps/web/vite.config.d.ts
 
 # Local signing certificates and private keys
 certs/

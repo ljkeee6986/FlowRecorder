@@ -1,0 +1,15 @@
+{
+  "name": "flowrecorder-classroom",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm run dev -w @flowrecorder/server\" \"npm run dev -w @flowrecorder/web\"",
+    "build": "npm run build -w @flowrecorder/contracts && npm run build -w @flowrecorder/server && npm run build -w @flowrecorder/web",
+    "test": "npm run test -w @flowrecorder/server && npm run test -w @flowrecorder/web",
+    "typecheck": "npm run typecheck -w @flowrecorder/contracts && npm run typecheck -w @flowrecorder/server && npm run typecheck -w @flowrecorder/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

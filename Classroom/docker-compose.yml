@@ -1,0 +1,29 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: flowrecorder
+      POSTGRES_USER: flowrecorder
+      POSTGRES_PASSWORD: flowrecorder
+    ports:
+      - "5432:5432"
+    volumes:
+      - classroom-postgres:/var/lib/postgresql/data
+      - ./infra/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flowrecorder"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - classroom-redis:/data
+
+volumes:
+  classroom-postgres:
+  classroom-redis:
