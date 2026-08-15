@@ -71,6 +71,10 @@ private enum AppBuildInfo {
     }
 }
 
+private extension Notification.Name {
+    static let teleprompterWindowDidClose = Notification.Name("FlowRecorder.teleprompterWindowDidClose")
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1357,6 +1361,9 @@ struct MainView: View {
         .onChange(of: model.selectedCaptureRect) { _, _ in
             Task { await model.refreshRecordingHealth() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .teleprompterWindowDidClose)) { _ in
+            teleprompterShown = false
+        }
         .sheet(isPresented: $windowPickerShown) {
             WindowPickerSheet(
                 model: model,
@@ -2216,6 +2223,7 @@ final class OverlayManager {
 
     private var cameraWindow: NSWindow?
     private var teleprompterWindow: NSWindow?
+    private var teleprompterWindowDelegate: TeleprompterWindowDelegate?
     private var teleprompterHost: NSHostingView<TeleprompterOverlayView>?
     private var regionSelectionWindow: NSWindow?
     private var recordingControlsWindow: NSPanel?
@@ -2299,10 +2307,17 @@ final class OverlayManager {
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 200, y: 200, width: 900, height: 260)
         let rect = NSRect(x: screenFrame.midX - 460, y: screenFrame.maxY - 270, width: 920, height: 220)
         let window = NSWindow(contentRect: rect,
-                              styleMask: [.titled, .resizable, .fullSizeContentView],
+                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered,
                               defer: false)
+        let delegate = TeleprompterWindowDelegate { [weak self] in
+            self?.teleprompterWindow = nil
+            self?.teleprompterHost = nil
+            self?.teleprompterWindowDelegate = nil
+            NotificationCenter.default.post(name: .teleprompterWindowDidClose, object: nil)
+        }
         window.contentView = host
+        window.delegate = delegate
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = true
@@ -2319,6 +2334,7 @@ final class OverlayManager {
         window.makeKeyAndOrderFront(nil)
         teleprompterHost = host
         teleprompterWindow = window
+        teleprompterWindowDelegate = delegate
     }
 
     func updateTeleprompter(text: String, fontSize: Double, scrollSpeed: Double) {
@@ -2382,6 +2398,18 @@ final class OverlayManager {
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(selectionView)
         regionSelectionWindow = window
+    }
+}
+
+private final class TeleprompterWindowDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        onClose()
     }
 }
 
