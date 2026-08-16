@@ -600,6 +600,39 @@ final class AppModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    func createClassroom(title: String) async -> Bool {
+        guard !isClassroomBusy, !isClassroomSelfTesting, !hasLiveClassroom else { return false }
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (2...80).contains(normalizedTitle.count) else {
+            classroomConnectionStatus = "课堂名称需要 2–80 个字符"
+            return false
+        }
+
+        isClassroomBusy = true
+        classroomConnectionStatus = "正在创建课堂..."
+        defer { isClassroomBusy = false }
+
+        do {
+            if classroomToken == nil {
+                try await connectClassroomWithRetry()
+            }
+            let response: ClassroomRoomResponse = try await classroomRequest(
+                "api/rooms",
+                method: "POST",
+                body: ["title": normalizedTitle],
+                token: classroomToken
+            )
+            replaceClassroom(response.room)
+            classroomConnectionStatus = "课堂已创建，可以复制链接或打开二维码"
+            status = "已创建在线课堂：\(response.room.title)"
+            return true
+        } catch {
+            classroomConnectionStatus = "创建课堂失败：\(humanReadable(error))"
+            return false
+        }
+    }
+
     func toggleSelectedClassroom() async {
         guard selectedClassroom?.status == "live" else {
             await startSelectedClassroom()
@@ -1884,6 +1917,7 @@ struct MainView: View {
     @State private var windowPickerShown = false
     @State private var windowSearchText = ""
     @State private var classroomQRCodeShown = false
+    @State private var classroomCreatorShown = false
 
     private let panelRadius: CGFloat = 18
     private let freshBlue = Color(red: 0.08, green: 0.40, blue: 0.76)
@@ -1954,6 +1988,13 @@ struct MainView: View {
                 isPresented: $classroomQRCodeShown
             )
             .frame(width: 440, height: 570)
+        }
+        .sheet(isPresented: $classroomCreatorShown) {
+            ClassroomCreateSheet(
+                model: model,
+                isPresented: $classroomCreatorShown
+            )
+            .frame(width: 460, height: 255)
         }
     }
 
@@ -2152,6 +2193,16 @@ struct MainView: View {
                     .labelsHidden()
                     .frame(maxWidth: .infinity)
                     .disabled(model.classroomRooms.isEmpty || model.isClassroomBusy || model.isClassroomSelfTesting)
+                    Button {
+                        classroomCreatorShown = true
+                    } label: {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(freshBlue)
+                    .help("新建课堂")
+                    .accessibilityLabel("新建课堂")
+                    .disabled(model.isClassroomBusy || model.isClassroomSelfTesting || model.hasLiveClassroom)
                 }
                 HStack(spacing: 9) {
                     Button { model.copySelectedClassroomWatchLink() } label: {
@@ -2807,6 +2858,117 @@ struct MainView: View {
     private func syncTeleprompter() {
         if teleprompterShown {
             OverlayManager.shared.updateTeleprompter(text: model.teleprompterText, fontSize: model.teleprompterFontSize, scrollSpeed: model.teleprompterScrollSpeed)
+        }
+    }
+}
+
+struct ClassroomCreateSheet: View {
+    @ObservedObject var model: AppModel
+    @Binding var isPresented: Bool
+    @State private var title = ""
+    @FocusState private var isTitleFocused: Bool
+
+    private let ink = Color(red: 0.10, green: 0.12, blue: 0.16)
+    private let blue = Color(red: 0.08, green: 0.40, blue: 0.76)
+
+    private var normalizedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var canCreate: Bool {
+        (2...80).contains(normalizedTitle.count) && !model.isClassroomBusy
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("新建课堂")
+                        .font(.system(size: 23, weight: .bold, design: .rounded))
+                        .foregroundStyle(ink)
+                    Text("创建后会自动生成新的学员链接和二维码")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.secondary.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭新建课堂")
+                .disabled(model.isClassroomBusy)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("课堂名称")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                TextField("例如：剪辑基础第 1 课", text: $title)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body)
+                    .focused($isTitleFocused)
+                    .onChange(of: title) { _, value in
+                        if value.count > 80 {
+                            title = String(value.prefix(80))
+                        }
+                    }
+                    .onSubmit(create)
+                Text("\(title.count) / 80")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                Button("取消") {
+                    isPresented = false
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.isClassroomBusy)
+
+                Button(action: create) {
+                    HStack(spacing: 7) {
+                        if model.isClassroomBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(model.isClassroomBusy ? "创建中" : "创建课堂")
+                    }
+                    .frame(minWidth: 78)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(blue)
+                .disabled(!canCreate)
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.96, green: 0.99, blue: 1.00),
+                    Color(red: 0.97, green: 0.96, blue: 1.00)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .onAppear {
+            isTitleFocused = true
+        }
+    }
+
+    private func create() {
+        guard canCreate else { return }
+        Task {
+            if await model.createClassroom(title: normalizedTitle) {
+                isPresented = false
+            }
         }
     }
 }
