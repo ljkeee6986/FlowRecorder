@@ -1,11 +1,20 @@
-import "dotenv/config";
+import { config as loadEnv } from "dotenv";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
+
+const workspaceEnvFile = fileURLToPath(new URL("../../../.env", import.meta.url));
+const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
+loadEnv({ path: workspaceEnvFile, quiet: true });
+
+export function resolveWorkspacePath(filePath: string): string {
+  return resolve(workspaceRoot, filePath);
+}
 
 const isProduction = process.env.NODE_ENV === "production";
 const defaultJwtSecret = "flowrecorder-classroom-local-development-only";
 const defaultTeacherAccessCode = "jack-demo";
 const persistenceDriver = process.env.PERSISTENCE_DRIVER ?? (isProduction ? "postgres" : "file");
-const defaultPersistenceFile = fileURLToPath(new URL("../../../.data/classroom-state.json", import.meta.url));
+const persistenceFile = resolveWorkspacePath(process.env.PERSISTENCE_FILE ?? ".data/classroom-state.json");
 
 export const config = {
   isProduction,
@@ -17,7 +26,7 @@ export const config = {
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
   persistence: {
     driver: persistenceDriver as "memory" | "file" | "postgres",
-    filePath: process.env.PERSISTENCE_FILE ?? defaultPersistenceFile,
+    filePath: persistenceFile,
     databaseUrl: process.env.DATABASE_URL ?? ""
   },
   trtc: {
