@@ -19,9 +19,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.1</string>
+	<string>0.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>21</string>
+	<string>22</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>NSCameraUsageDescription</key>
@@ -30,6 +30,13 @@
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>用于录制讲解声音。</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>用于连接录屏大师Jack的本地课堂服务。</string>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
 </dict>

@@ -63,8 +63,10 @@ export function createClassroomServer(store = new ClassroomStore(), persistenceN
       ok: true,
       version: "0.2.0",
       mediaProvider: mediaProvider.name,
+      zeroCostMode: config.zeroCostMode,
       paymentsEnabled: config.paymentsEnabled,
-      persistence: persistenceName
+      persistence: persistenceName,
+      publicWebUrl: config.publicWebUrl
     });
   });
 

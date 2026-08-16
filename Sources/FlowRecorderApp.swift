@@ -75,6 +75,60 @@ private extension Notification.Name {
     static let teleprompterWindowDidClose = Notification.Name("FlowRecorder.teleprompterWindowDidClose")
 }
 
+struct ClassroomRoom: Decodable, Identifiable, Hashable {
+    let id: String
+    let shareCode: String
+    let title: String
+    let status: String
+}
+
+private struct ClassroomHealthResponse: Decodable {
+    let ok: Bool
+    let mediaProvider: String
+    let zeroCostMode: Bool
+    let persistence: String
+    let publicWebUrl: String
+}
+
+private struct ClassroomSessionResponse: Decodable {
+    let token: String
+}
+
+private struct ClassroomRoomsResponse: Decodable {
+    let rooms: [ClassroomRoom]
+}
+
+private struct ClassroomRoomResponse: Decodable {
+    let room: ClassroomRoom
+}
+
+private struct ClassroomAPIErrorResponse: Decodable {
+    let error: String
+}
+
+private enum ClassroomClientError: LocalizedError {
+    case invalidServerAddress
+    case invalidResponse
+    case server(String)
+    case missingRoom
+    case recordingDidNotStart
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidServerAddress:
+            return "课堂服务地址无效"
+        case .invalidResponse:
+            return "课堂服务返回了无法识别的数据"
+        case .server(let message):
+            return message
+        case .missingRoom:
+            return "还没有可用课堂"
+        case .recordingDidNotStart:
+            return "本地录像没有成功启动，课堂未开始"
+        }
+    }
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -161,13 +215,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if model.isCountingDown {
             model.cancelCountdown()
-            return .terminateNow
+            if !model.hasLiveClassroom {
+                return .terminateNow
+            }
+        }
+
+        if model.isClassroomBusy {
+            showMainWindow()
+            model.status = "正在同步课堂状态，完成前不能退出。"
+            return .terminateCancel
         }
 
         if model.isBusy {
             showMainWindow()
             model.status = "正在安全保存视频，保存完成前不能退出；强制退出可能生成损坏录屏。"
             return .terminateCancel
+        }
+
+        if model.hasLiveClassroom {
+            showMainWindow()
+            model.status = "正在结束课堂并安全保存本地录像，完成后自动退出。"
+            Task { @MainActor in
+                let ended = await model.endSelectedClassroom()
+                guard ended else {
+                    showMainWindow()
+                    model.status = "课堂结束失败，已取消退出；请检查本地课堂服务。"
+                    NSApp.reply(toApplicationShouldTerminate: false)
+                    return
+                }
+
+                let saved = await model.stopRecording()
+                if !saved {
+                    showMainWindow()
+                    model.status = "本地录像保存失败，已取消退出；请复制诊断后再处理。"
+                }
+                NSApp.reply(toApplicationShouldTerminate: saved)
+            }
+            return .terminateLater
         }
 
         if model.isRecording || model.hasActiveRecording {
@@ -207,6 +291,21 @@ final class AppModel: ObservableObject {
     @Published private(set) var recoveredInterruptedRecordingURLs: [URL] = []
     @Published private(set) var recordingHealthItems = RecordingHealthItem.initialItems
     @Published private(set) var isCheckingRecordingHealth = false
+    @Published var classroomServerAddress = "http://localhost:4100" {
+        didSet { persist(classroomServerAddress, forKey: DefaultsKey.classroomServerAddress) }
+    }
+    @Published var classroomTeacherAccessCode = "jack-demo"
+    @Published var classroomSyncLocalRecording = true {
+        didSet { persist(classroomSyncLocalRecording, forKey: DefaultsKey.classroomSyncLocalRecording) }
+    }
+    @Published private(set) var classroomRooms: [ClassroomRoom] = []
+    @Published var selectedClassroomID: String?
+    @Published private(set) var classroomConnectionStatus = "尚未连接本地课堂服务"
+    @Published private(set) var classroomMediaProvider = "未连接"
+    @Published private(set) var classroomZeroCostMode = true
+    @Published private(set) var classroomPersistence = "未知"
+    @Published private(set) var classroomWebURL: URL?
+    @Published private(set) var isClassroomBusy = false
     @Published var includeSystemAudio = true {
         didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
     }
@@ -243,6 +342,8 @@ final class AppModel: ObservableObject {
     private var recordingTimer: Timer?
     private var recordingStartedAt: Date?
     private var isLoadingPersistentSettings = false
+    private var classroomToken: String?
+    private var recordingStartedByClassroom = false
 
     private enum DefaultsKey {
         static let includeSystemAudio = "FlowRecorder.includeSystemAudio"
@@ -253,6 +354,8 @@ final class AppModel: ObservableObject {
         static let teleprompterFontSize = "FlowRecorder.teleprompterFontSize"
         static let teleprompterScrollSpeed = "FlowRecorder.teleprompterScrollSpeed"
         static let teleprompterText = "FlowRecorder.teleprompterText"
+        static let classroomServerAddress = "FlowRecorder.classroomServerAddress"
+        static let classroomSyncLocalRecording = "FlowRecorder.classroomSyncLocalRecording"
     }
 
     private static let defaultTeleprompterText = """
@@ -328,6 +431,247 @@ final class AppModel: ObservableObject {
         if let savedText = defaults.string(forKey: DefaultsKey.teleprompterText),
            !savedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             teleprompterText = savedText
+        }
+
+        if let savedAddress = defaults.string(forKey: DefaultsKey.classroomServerAddress),
+           !savedAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            classroomServerAddress = savedAddress
+        }
+
+        if defaults.object(forKey: DefaultsKey.classroomSyncLocalRecording) != nil {
+            classroomSyncLocalRecording = defaults.bool(forKey: DefaultsKey.classroomSyncLocalRecording)
+        }
+    }
+
+    var selectedClassroom: ClassroomRoom? {
+        guard let selectedClassroomID else { return classroomRooms.first }
+        return classroomRooms.first { $0.id == selectedClassroomID }
+    }
+
+    var hasLiveClassroom: Bool {
+        selectedClassroom?.status == "live"
+    }
+
+    var selectedClassroomWatchURL: URL? {
+        guard let classroomWebURL, let selectedClassroom else { return nil }
+        return classroomWebURL
+            .appendingPathComponent("live", isDirectory: true)
+            .appendingPathComponent(selectedClassroom.shareCode)
+    }
+
+    func refreshClassroomConnection() async {
+        guard !isClassroomBusy else { return }
+        isClassroomBusy = true
+        classroomConnectionStatus = "正在连接本地课堂服务..."
+        defer { isClassroomBusy = false }
+
+        do {
+            try await connectClassroom()
+        } catch {
+            classroomToken = nil
+            classroomRooms = []
+            selectedClassroomID = nil
+            classroomMediaProvider = "未连接"
+            classroomConnectionStatus = "连接失败：\(humanReadable(error))"
+        }
+    }
+
+    func toggleSelectedClassroom() async {
+        guard selectedClassroom?.status == "live" else {
+            await startSelectedClassroom()
+            return
+        }
+        await endSelectedClassroom()
+    }
+
+    func startSelectedClassroom() async {
+        guard !isClassroomBusy, !isBusy, !isCountingDown else { return }
+        isClassroomBusy = true
+        classroomConnectionStatus = "正在准备课堂..."
+        defer { isClassroomBusy = false }
+
+        var startedRecordingForThisClassroom = false
+        do {
+            if classroomToken == nil || classroomRooms.isEmpty {
+                try await connectClassroom()
+            }
+            guard let room = selectedClassroom else { throw ClassroomClientError.missingRoom }
+
+            if classroomSyncLocalRecording && !isRecording && !hasActiveRecording {
+                classroomConnectionStatus = "先启动本地安全录像，成功后再开始课堂..."
+                await startRecording()
+                guard isRecording else { throw ClassroomClientError.recordingDidNotStart }
+                recordingStartedByClassroom = true
+                startedRecordingForThisClassroom = true
+            }
+
+            let response: ClassroomRoomResponse = try await classroomRequest(
+                "api/rooms/\(room.id)/start",
+                method: "POST",
+                token: classroomToken
+            )
+            replaceClassroom(response.room)
+            classroomConnectionStatus = classroomSyncLocalRecording
+                ? "课堂已开始，本地录像正在安全保存"
+                : "课堂已开始，本地录像未开启"
+            status = "在线课堂已开始：\(response.room.title)"
+        } catch {
+            if startedRecordingForThisClassroom {
+                classroomConnectionStatus = "课堂启动失败，正在安全保存刚才的本地录像..."
+                _ = await stopRecording()
+                recordingStartedByClassroom = false
+            }
+            classroomConnectionStatus = "课堂启动失败：\(humanReadable(error))"
+        }
+    }
+
+    @discardableResult
+    func endSelectedClassroom() async -> Bool {
+        guard !isClassroomBusy, !isBusy, !isCountingDown else { return false }
+        guard let room = selectedClassroom else {
+            classroomConnectionStatus = "结束失败：还没有可用课堂"
+            return false
+        }
+        isClassroomBusy = true
+        classroomConnectionStatus = "正在结束课堂..."
+        defer { isClassroomBusy = false }
+
+        do {
+            if classroomToken == nil {
+                try await connectClassroom()
+            }
+            let response: ClassroomRoomResponse = try await classroomRequest(
+                "api/rooms/\(room.id)/end",
+                method: "POST",
+                token: classroomToken
+            )
+            replaceClassroom(response.room)
+
+            if recordingStartedByClassroom && (isRecording || hasActiveRecording) {
+                classroomConnectionStatus = "课堂已结束，正在验证并保存本地 MP4..."
+                let saved = await stopRecording()
+                recordingStartedByClassroom = false
+                classroomConnectionStatus = saved
+                    ? "课堂已结束，本地 MP4 已安全保存"
+                    : "课堂已结束，但本地录像保存需要检查"
+            } else {
+                classroomConnectionStatus = "课堂已结束"
+            }
+            status = "在线课堂已结束：\(response.room.title)"
+            return true
+        } catch {
+            classroomConnectionStatus = "课堂结束失败：\(humanReadable(error))；本地录像保持不变"
+            return false
+        }
+    }
+
+    func openClassroomTeacherDashboard() {
+        guard let classroomWebURL else {
+            classroomConnectionStatus = "请先连接本地课堂服务"
+            return
+        }
+        NSWorkspace.shared.open(classroomWebURL.appendingPathComponent("teacher"))
+    }
+
+    func openSelectedClassroomWatchPage() {
+        guard let selectedClassroomWatchURL else {
+            classroomConnectionStatus = "请先连接并选择课堂"
+            return
+        }
+        NSWorkspace.shared.open(selectedClassroomWatchURL)
+    }
+
+    func copySelectedClassroomWatchLink() {
+        guard let selectedClassroomWatchURL else {
+            classroomConnectionStatus = "请先连接并选择课堂"
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(selectedClassroomWatchURL.absoluteString, forType: .string)
+        classroomConnectionStatus = "学员链接已复制"
+    }
+
+    private func connectClassroom() async throws {
+        let health: ClassroomHealthResponse = try await classroomRequest("api/health")
+        guard health.ok else { throw ClassroomClientError.invalidResponse }
+
+        let session: ClassroomSessionResponse = try await classroomRequest(
+            "api/teacher/session",
+            method: "POST",
+            body: ["accessCode": classroomTeacherAccessCode, "nickname": "Jack 讲师"]
+        )
+        let roomList: ClassroomRoomsResponse = try await classroomRequest(
+            "api/rooms",
+            token: session.token
+        )
+
+        classroomToken = session.token
+        classroomRooms = roomList.rooms
+        if selectedClassroomID == nil || !roomList.rooms.contains(where: { $0.id == selectedClassroomID }) {
+            selectedClassroomID = roomList.rooms.first?.id
+        }
+        classroomMediaProvider = health.mediaProvider
+        classroomZeroCostMode = health.zeroCostMode
+        classroomPersistence = health.persistence
+        classroomWebURL = URL(string: health.publicWebUrl)
+
+        if roomList.rooms.isEmpty {
+            classroomConnectionStatus = "服务已连接，但还没有课堂；请先打开讲师后台创建"
+        } else if health.zeroCostMode {
+            classroomConnectionStatus = "本地课堂已连接，零成本保护已开启"
+        } else {
+            classroomConnectionStatus = "课堂已连接；零成本保护未开启，请检查配置"
+        }
+    }
+
+    private func replaceClassroom(_ room: ClassroomRoom) {
+        if let index = classroomRooms.firstIndex(where: { $0.id == room.id }) {
+            classroomRooms[index] = room
+        } else {
+            classroomRooms.append(room)
+        }
+        selectedClassroomID = room.id
+    }
+
+    private func classroomRequest<Response: Decodable>(
+        _ path: String,
+        method: String = "GET",
+        body: [String: Any]? = nil,
+        token: String? = nil
+    ) async throws -> Response {
+        let trimmedAddress = classroomServerAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseAddress = trimmedAddress.hasSuffix("/") ? trimmedAddress : "\(trimmedAddress)/"
+        guard let baseURL = URL(string: baseAddress),
+              ["http", "https"].contains(baseURL.scheme?.lowercased() ?? ""),
+              baseURL.host != nil,
+              let url = URL(string: path, relativeTo: baseURL)?.absoluteURL else {
+            throw ClassroomClientError.invalidServerAddress
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let body {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ClassroomClientError.invalidResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let payload = try? JSONDecoder().decode(ClassroomAPIErrorResponse.self, from: data)
+            throw ClassroomClientError.server(payload?.error ?? "课堂服务请求失败（\(httpResponse.statusCode)）")
+        }
+        do {
+            return try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            throw ClassroomClientError.invalidResponse
         }
     }
 
@@ -1299,8 +1643,23 @@ struct RecordingHealthItem: Identifiable {
     ]
 }
 
+private enum MainWorkspace: String, CaseIterable, Identifiable {
+    case recording
+    case classroom
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .recording: return "本地录制"
+        case .classroom: return "在线课堂"
+        }
+    }
+}
+
 struct MainView: View {
     @ObservedObject var model: AppModel
+    @State private var selectedWorkspace = MainWorkspace.recording
     @State private var cameraShown = false
     @State private var teleprompterShown = false
     @State private var windowPickerShown = false
@@ -1323,22 +1682,12 @@ struct MainView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
-                    if model.hasRecoveredInterruptedRecordings {
-                        recoveryBanner
+                    workspaceSwitcher
+                    if selectedWorkspace == .recording {
+                        localRecordingWorkspace
+                    } else {
+                        classroomWorkspace
                     }
-                    HStack(alignment: .top, spacing: 14) {
-                        recordingHero.frame(minWidth: 312, maxWidth: 348)
-                        VStack(spacing: 14) {
-                            quickTools
-                            sourcePanel
-                        }
-                        .frame(maxWidth: .infinity)
-                    }
-                    HStack(alignment: .top, spacing: 14) {
-                        teleprompterPanel.frame(maxWidth: .infinity)
-                        recordingsPanel.frame(width: 400)
-                    }
-                    statusBox
                 }
                 .padding(24)
             }
@@ -1347,6 +1696,7 @@ struct MainView: View {
             Task {
                 await model.refreshWindowOptions()
                 await model.refreshRecordingHealth()
+                await model.refreshClassroomConnection()
             }
         }
         .onChange(of: model.includeMicrophone) { _, _ in
@@ -1360,6 +1710,11 @@ struct MainView: View {
         }
         .onChange(of: model.selectedCaptureRect) { _, _ in
             Task { await model.refreshRecordingHealth() }
+        }
+        .onChange(of: selectedWorkspace) { _, workspace in
+            if workspace == .classroom {
+                Task { await model.refreshClassroomConnection() }
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .teleprompterWindowDidClose)) { _ in
             teleprompterShown = false
@@ -1389,7 +1744,7 @@ struct MainView: View {
                 Text("录屏大师Jack")
                     .font(.system(size: 27, weight: .bold, design: .rounded))
                     .foregroundStyle(ink)
-                Text("录制、收声、提词和窗口捕捉。")
+                Text(selectedWorkspace == .recording ? "录制、收声、提词和窗口捕捉。" : "课堂控制、学员链接和本地安全录像。")
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(.secondary)
                 copyrightNotice
@@ -1401,8 +1756,13 @@ struct MainView: View {
     }
 
     private var statusPill: some View {
-        let text = model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : (model.isRecording ? "REC" : "READY"))
-        let tint = model.isCountingDown ? Color.orange : (model.isBusy ? Color.orange : (model.isRecording ? Color.red : freshMint))
+        let classroomLive = model.selectedClassroom?.status == "live"
+        let text = selectedWorkspace == .classroom
+            ? (model.isClassroomBusy ? "SYNC" : (classroomLive ? "LIVE" : "LOCAL"))
+            : (model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : (model.isRecording ? "REC" : "READY")))
+        let tint = selectedWorkspace == .classroom
+            ? (classroomLive ? Color.red : freshMint)
+            : (model.isCountingDown ? Color.orange : (model.isBusy ? Color.orange : (model.isRecording ? Color.red : freshMint)))
         return HStack(spacing: 8) {
             Circle().fill(tint).frame(width: 8, height: 8)
             Text(text)
@@ -1413,6 +1773,203 @@ struct MainView: View {
         .padding(.vertical, 8)
         .background(surface, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(tint.opacity(0.22), lineWidth: 1))
+    }
+
+    private var workspaceSwitcher: some View {
+        Picker("工作模式", selection: $selectedWorkspace) {
+            ForEach(MainWorkspace.allCases) { workspace in
+                Text(workspace.label).tag(workspace)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 300)
+    }
+
+    @ViewBuilder
+    private var localRecordingWorkspace: some View {
+        if model.hasRecoveredInterruptedRecordings {
+            recoveryBanner
+        }
+        HStack(alignment: .top, spacing: 14) {
+            recordingHero.frame(minWidth: 312, maxWidth: 348)
+            VStack(spacing: 14) {
+                quickTools
+                sourcePanel
+            }
+            .frame(maxWidth: .infinity)
+        }
+        HStack(alignment: .top, spacing: 14) {
+            teleprompterPanel.frame(maxWidth: .infinity)
+            recordingsPanel.frame(width: 400)
+        }
+        statusBox
+    }
+
+    private var classroomWorkspace: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            classroomHero
+            HStack(alignment: .top, spacing: 14) {
+                classroomConnectionPanel
+                    .frame(maxWidth: .infinity)
+                classroomSharePanel
+                    .frame(maxWidth: .infinity)
+            }
+            classroomStatusPanel
+        }
+    }
+
+    private var classroomHero: some View {
+        let room = model.selectedClassroom
+        let isLive = room?.status == "live"
+        return HStack(spacing: 22) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(isLive ? Color.red : freshMint)
+                        .frame(width: 9, height: 9)
+                    Text(isLive ? "课堂直播中" : "课堂待开始")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.72))
+                }
+                Text(room?.title ?? "在线课堂")
+                    .font(.system(size: 27, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                Text(model.classroomZeroCostMode ? "零成本保护开启 · 当前不连接收费音视频" : "云媒体配置可用")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.62))
+            }
+            Spacer()
+            Toggle("同时保存本地 MP4", isOn: $model.classroomSyncLocalRecording)
+                .toggleStyle(.switch)
+                .tint(freshMint)
+                .foregroundStyle(.white.opacity(0.78))
+                .disabled(isLive || model.isClassroomBusy || model.isBusy)
+            Button {
+                Task { await model.toggleSelectedClassroom() }
+            } label: {
+                Label(
+                    isLive ? "结束课堂" : "开始课堂",
+                    systemImage: isLive ? "stop.fill" : "play.fill"
+                )
+                .font(.system(size: 15, weight: .semibold))
+                .frame(minWidth: 112)
+                .padding(.vertical, 5)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(isLive ? .red : freshMint)
+            .disabled(room == nil || model.isClassroomBusy || model.isBusy || model.isCountingDown)
+        }
+        .padding(22)
+        .background(console, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1))
+    }
+
+    private var classroomConnectionPanel: some View {
+        freshPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionHeader("本地课堂服务", "连接这台电脑上运行的课堂后台")
+                VStack(spacing: 10) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "server.rack")
+                            .foregroundStyle(freshBlue)
+                            .frame(width: 22)
+                        TextField("服务地址", text: $model.classroomServerAddress)
+                            .textFieldStyle(.roundedBorder)
+                    }
+                    HStack(spacing: 10) {
+                        Image(systemName: "key.fill")
+                            .foregroundStyle(freshIndigo)
+                            .frame(width: 22)
+                        SecureField("讲师口令", text: $model.classroomTeacherAccessCode)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            Task { await model.refreshClassroomConnection() }
+                        } label: {
+                            Label(model.isClassroomBusy ? "连接中" : "连接", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(freshBlue)
+                        .disabled(model.isClassroomBusy || model.classroomTeacherAccessCode.isEmpty)
+                    }
+                }
+                HStack(spacing: 8) {
+                    Label(
+                        model.classroomZeroCostMode ? "零成本保护" : "费用保护关闭",
+                        systemImage: model.classroomZeroCostMode ? "shield.checkered" : "exclamationmark.triangle.fill"
+                    )
+                    Divider().frame(height: 14)
+                    Text("媒体：\(model.classroomMediaProvider)")
+                    Divider().frame(height: 14)
+                    Text("数据：\(model.classroomPersistence)")
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(model.classroomZeroCostMode ? freshMint : Color.orange)
+            }
+        }
+    }
+
+    private var classroomSharePanel: some View {
+        freshPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                sectionHeader("课堂与分享", "课堂链接可在同一 Wi-Fi 的手机浏览器打开")
+                HStack(spacing: 10) {
+                    Text("课堂")
+                        .font(.callout.weight(.semibold))
+                    Picker("", selection: $model.selectedClassroomID) {
+                        ForEach(model.classroomRooms) { room in
+                            Text(room.title).tag(Optional(room.id))
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                    .disabled(model.classroomRooms.isEmpty || model.isClassroomBusy)
+                }
+                HStack(spacing: 9) {
+                    Button { model.copySelectedClassroomWatchLink() } label: {
+                        Label("复制学员链接", systemImage: "link")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(freshMint)
+                    Button { model.openSelectedClassroomWatchPage() } label: {
+                        Label("学员页", systemImage: "safari")
+                    }
+                    .buttonStyle(.bordered)
+                    Button { model.openClassroomTeacherDashboard() } label: {
+                        Label("讲师后台", systemImage: "rectangle.3.group")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .disabled(model.selectedClassroom == nil)
+                if let watchURL = model.selectedClassroomWatchURL {
+                    Text(watchURL.absoluteString)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                }
+            }
+        }
+    }
+
+    private var classroomStatusPanel: some View {
+        freshPanel {
+            HStack(spacing: 12) {
+                Image(systemName: model.classroomConnectionStatus.contains("失败") ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(model.classroomConnectionStatus.contains("失败") ? Color.orange : freshMint)
+                Text(model.classroomConnectionStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+                Spacer()
+                if model.isRecording {
+                    Label("本地录像中", systemImage: "record.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.red)
+                }
+            }
+        }
     }
 
     private var recordingHero: some View {

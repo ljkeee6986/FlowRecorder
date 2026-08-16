@@ -15,12 +15,14 @@ const defaultJwtSecret = "flowrecorder-classroom-local-development-only";
 const defaultTeacherAccessCode = "jack-demo";
 const persistenceDriver = process.env.PERSISTENCE_DRIVER ?? (isProduction ? "postgres" : "file");
 const persistenceFile = resolveWorkspacePath(process.env.PERSISTENCE_FILE ?? ".data/classroom-state.json");
+const zeroCostMode = process.env.ZERO_COST_MODE !== "false";
 
 export const config = {
   isProduction,
   port: Number(process.env.PORT ?? 4100),
   webOrigin: process.env.WEB_ORIGIN ?? "http://localhost:4173",
   publicWebUrl: process.env.PUBLIC_WEB_URL ?? "http://localhost:4173",
+  zeroCostMode,
   jwtSecret: process.env.JWT_SECRET ?? defaultJwtSecret,
   teacherAccessCode: process.env.TEACHER_ACCESS_CODE ?? defaultTeacherAccessCode,
   paymentsEnabled: process.env.PAYMENTS_ENABLED === "true",
@@ -63,4 +65,8 @@ if (config.trtc.enabled && (!config.trtc.sdkAppId || !config.trtc.secretKey)) {
 
 if (config.trtc.enabled && !config.trtc.strictPermissions) {
   throw new Error("TRTC_ENABLED requires TRTC_STRICT_PERMISSIONS=true after enabling PrivateMapKey checks in Tencent Cloud");
+}
+
+if (config.zeroCostMode && (config.trtc.enabled || config.paymentsEnabled)) {
+  throw new Error("ZERO_COST_MODE forbids TRTC and payment providers; set ZERO_COST_MODE=false only after approving paid cloud usage");
 }

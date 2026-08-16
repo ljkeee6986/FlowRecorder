@@ -12,6 +12,16 @@ async function teacherToken(app: ReturnType<typeof createClassroomServer>["app"]
 }
 
 describe("classroom API", () => {
+  it("reports the active cost guard and public classroom URL", async () => {
+    const server = createClassroomServer(new ClassroomStore(false));
+    const response = await request(server.app).get("/api/health").expect(200);
+
+    expect(response.body.zeroCostMode).toBe(true);
+    expect(response.body.mediaProvider).toBe("mock");
+    expect(response.body.publicWebUrl).toMatch(/^http/);
+    server.io.close();
+  });
+
   it("creates a room and joins through its private share code", async () => {
     const server = createClassroomServer(new ClassroomStore(false));
     const token = await teacherToken(server.app);
