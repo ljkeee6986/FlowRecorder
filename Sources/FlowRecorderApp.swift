@@ -428,6 +428,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var classroomPersistence = "未知"
     @Published private(set) var classroomWebURL: URL?
     @Published private(set) var isClassroomBusy = false
+    @Published private(set) var isClassroomSelfTesting = false
+    @Published private(set) var classroomSelfTestResultURL: URL?
     @Published var includeSystemAudio = true {
         didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
     }
@@ -606,6 +608,80 @@ final class AppModel: ObservableObject {
         await endSelectedClassroom()
     }
 
+    func runClassroomRecordingSelfTest() async {
+        guard !isClassroomSelfTesting,
+              !isClassroomBusy,
+              !isBusy,
+              !isCountingDown,
+              !isRecording,
+              !hasActiveRecording,
+              !hasLiveClassroom else {
+            classroomConnectionStatus = "联动自检需要课堂和本地录像都处于停止状态"
+            return
+        }
+
+        isClassroomSelfTesting = true
+        classroomSelfTestResultURL = nil
+        let previousSyncSetting = classroomSyncLocalRecording
+        classroomSyncLocalRecording = true
+        defer {
+            classroomSyncLocalRecording = previousSyncSetting
+            isClassroomSelfTesting = false
+        }
+
+        do {
+            if classroomToken == nil || classroomRooms.isEmpty {
+                classroomConnectionStatus = "联动自检：正在连接零成本课堂服务..."
+                try await connectClassroomWithRetry()
+            }
+            guard classroomZeroCostMode, classroomMediaProvider == "mock" else {
+                classroomConnectionStatus = "联动自检已停止：仅允许在零成本 mock 模式运行"
+                return
+            }
+
+            classroomConnectionStatus = "联动自检：正在启动安全录像和课堂..."
+            await startSelectedClassroom()
+            guard hasLiveClassroom, isRecording || hasActiveRecording else {
+                classroomConnectionStatus = "联动自检失败：课堂或本地录像没有成功启动"
+                return
+            }
+
+            for remaining in stride(from: 8, through: 1, by: -1) {
+                classroomConnectionStatus = "联动自检：正在录制测试画面，剩余 \(remaining) 秒"
+                try await Task.sleep(for: .seconds(1))
+            }
+
+            classroomConnectionStatus = "联动自检：正在结束课堂并验证 MP4..."
+            guard await endSelectedClassroom() else {
+                classroomConnectionStatus = "联动自检失败：课堂未能正常结束，本地录像保持不变"
+                return
+            }
+            guard let outputURL,
+                  FileManager.default.fileExists(atPath: outputURL.path) else {
+                classroomConnectionStatus = "联动自检失败：没有找到保存后的 MP4"
+                return
+            }
+
+            classroomSelfTestResultURL = outputURL
+            classroomConnectionStatus = "联动自检通过：课堂状态与本地 MP4 均已安全完成"
+            status = "课堂联动自检通过：\(outputURL.lastPathComponent)"
+        } catch is CancellationError {
+            if hasLiveClassroom {
+                _ = await endSelectedClassroom()
+            } else if isRecording || hasActiveRecording {
+                _ = await stopRecording()
+            }
+            classroomConnectionStatus = "联动自检已取消"
+        } catch {
+            if hasLiveClassroom {
+                _ = await endSelectedClassroom()
+            } else if isRecording || hasActiveRecording {
+                _ = await stopRecording()
+            }
+            classroomConnectionStatus = "联动自检失败：\(humanReadable(error))"
+        }
+    }
+
     func startSelectedClassroom() async {
         guard !isClassroomBusy, !isBusy, !isCountingDown else { return }
         isClassroomBusy = true
@@ -712,6 +788,11 @@ final class AppModel: ObservableObject {
         pasteboard.clearContents()
         pasteboard.setString(selectedClassroomWatchURL.absoluteString, forType: .string)
         classroomConnectionStatus = "学员链接已复制"
+    }
+
+    func revealClassroomSelfTestRecording() {
+        guard let classroomSelfTestResultURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([classroomSelfTestResultURL])
     }
 
     private func connectClassroom() async throws {
@@ -1896,7 +1977,7 @@ struct MainView: View {
     private var statusPill: some View {
         let classroomLive = model.selectedClassroom?.status == "live"
         let text = selectedWorkspace == .classroom
-            ? (model.isClassroomBusy ? "SYNC" : (classroomLive ? "LIVE" : "LOCAL"))
+            ? (model.isClassroomSelfTesting ? "TEST" : (model.isClassroomBusy ? "SYNC" : (classroomLive ? "LIVE" : "LOCAL")))
             : (model.isCountingDown ? "COUNTDOWN" : (model.isBusy ? "SAVING" : (model.isRecording ? "REC" : "READY")))
         let tint = selectedWorkspace == .classroom
             ? (classroomLive ? Color.red : freshMint)
@@ -1982,7 +2063,7 @@ struct MainView: View {
                 .toggleStyle(.switch)
                 .tint(freshMint)
                 .foregroundStyle(.white.opacity(0.78))
-                .disabled(isLive || model.isClassroomBusy || model.isBusy)
+                .disabled(isLive || model.isClassroomBusy || model.isClassroomSelfTesting || model.isBusy)
             Button {
                 Task { await model.toggleSelectedClassroom() }
             } label: {
@@ -1996,7 +2077,7 @@ struct MainView: View {
             }
             .buttonStyle(.borderedProminent)
             .tint(isLive ? .red : freshMint)
-            .disabled(room == nil || model.isClassroomBusy || model.isBusy || model.isCountingDown)
+            .disabled(room == nil || model.isClassroomBusy || model.isClassroomSelfTesting || model.isBusy || model.isCountingDown)
         }
         .padding(22)
         .background(console, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -2028,7 +2109,7 @@ struct MainView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(freshBlue)
-                        .disabled(model.isClassroomBusy || model.classroomTeacherAccessCode.isEmpty)
+                        .disabled(model.isClassroomBusy || model.isClassroomSelfTesting || model.classroomTeacherAccessCode.isEmpty)
                     }
                 }
                 HStack(spacing: 8) {
@@ -2061,7 +2142,7 @@ struct MainView: View {
                     }
                     .labelsHidden()
                     .frame(maxWidth: .infinity)
-                    .disabled(model.classroomRooms.isEmpty || model.isClassroomBusy)
+                    .disabled(model.classroomRooms.isEmpty || model.isClassroomBusy || model.isClassroomSelfTesting)
                 }
                 HStack(spacing: 9) {
                     Button { model.copySelectedClassroomWatchLink() } label: {
@@ -2078,7 +2159,7 @@ struct MainView: View {
                     }
                     .buttonStyle(.bordered)
                 }
-                .disabled(model.selectedClassroom == nil)
+                .disabled(model.selectedClassroom == nil || model.isClassroomSelfTesting)
                 if let watchURL = model.selectedClassroomWatchURL {
                     Text(watchURL.absoluteString)
                         .font(.caption.monospaced())
@@ -2092,10 +2173,17 @@ struct MainView: View {
 
     private var classroomStatusPanel: some View {
         freshPanel {
+            let needsAttention = model.classroomConnectionStatus.contains("失败")
+                || model.classroomConnectionStatus.contains("停止")
             HStack(spacing: 12) {
-                Image(systemName: model.classroomConnectionStatus.contains("失败") ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(model.classroomConnectionStatus.contains("失败") ? Color.orange : freshMint)
+                if model.isClassroomSelfTesting {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: needsAttention ? "exclamationmark.triangle.fill" : "checkmark.seal.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(needsAttention ? Color.orange : freshMint)
+                }
                 Text(model.classroomConnectionStatus)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -2106,6 +2194,28 @@ struct MainView: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.red)
                 }
+                if model.classroomSelfTestResultURL != nil {
+                    Button { model.revealClassroomSelfTestRecording() } label: {
+                        Label("测试 MP4", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Button {
+                    Task { await model.runClassroomRecordingSelfTest() }
+                } label: {
+                    Label(model.isClassroomSelfTesting ? "自检中" : "联动自检", systemImage: "stethoscope")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(freshBlue)
+                .disabled(
+                    model.isClassroomSelfTesting
+                    || model.isClassroomBusy
+                    || model.isBusy
+                    || model.isCountingDown
+                    || model.isRecording
+                    || model.hasLiveClassroom
+                    || model.selectedClassroom == nil
+                )
             }
         }
     }
