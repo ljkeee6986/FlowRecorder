@@ -1883,6 +1883,7 @@ struct MainView: View {
     @State private var teleprompterShown = false
     @State private var windowPickerShown = false
     @State private var windowSearchText = ""
+    @State private var classroomQRCodeShown = false
 
     private let panelRadius: CGFloat = 18
     private let freshBlue = Color(red: 0.08, green: 0.40, blue: 0.76)
@@ -1945,6 +1946,14 @@ struct MainView: View {
                 isPresented: $windowPickerShown
             )
             .frame(width: 720, height: 560)
+        }
+        .sheet(isPresented: $classroomQRCodeShown) {
+            ClassroomQRCodeSheet(
+                classroomTitle: model.selectedClassroom?.title ?? "在线课堂",
+                watchURL: model.selectedClassroomWatchURL,
+                isPresented: $classroomQRCodeShown
+            )
+            .frame(width: 440, height: 570)
         }
     }
 
@@ -2152,6 +2161,12 @@ struct MainView: View {
                     .tint(freshMint)
                     Button { model.openSelectedClassroomWatchPage() } label: {
                         Label("学员页", systemImage: "safari")
+                    }
+                    .buttonStyle(.bordered)
+                    Button {
+                        classroomQRCodeShown = true
+                    } label: {
+                        Label("二维码", systemImage: "qrcode")
                     }
                     .buttonStyle(.bordered)
                     Button { model.openClassroomTeacherDashboard() } label: {
@@ -2793,6 +2808,140 @@ struct MainView: View {
         if teleprompterShown {
             OverlayManager.shared.updateTeleprompter(text: model.teleprompterText, fontSize: model.teleprompterFontSize, scrollSpeed: model.teleprompterScrollSpeed)
         }
+    }
+}
+
+struct ClassroomQRCodeSheet: View {
+    let classroomTitle: String
+    let watchURL: URL?
+    @Binding var isPresented: Bool
+
+    private let ink = Color(red: 0.10, green: 0.12, blue: 0.16)
+    private let mint = Color(red: 0.06, green: 0.56, blue: 0.48)
+    private let blue = Color(red: 0.08, green: 0.40, blue: 0.76)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("课堂二维码")
+                        .font(.system(size: 23, weight: .bold, design: .rounded))
+                        .foregroundStyle(ink)
+                    Text(classroomTitle)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+                Spacer()
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.secondary.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭二维码")
+            }
+
+            if let watchURL {
+                VStack(spacing: 14) {
+                    if let image = Self.makeQRCode(for: watchURL.absoluteString) {
+                        Image(nsImage: image)
+                            .interpolation(.none)
+                            .resizable()
+                            .aspectRatio(1, contentMode: .fit)
+                            .frame(width: 310, height: 310)
+                            .padding(16)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.black.opacity(0.12), lineWidth: 1))
+                            .shadow(color: Color.black.opacity(0.10), radius: 12, y: 4)
+                    } else {
+                        unavailableState
+                    }
+
+                    Text("学员用微信扫一扫即可进入课堂")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.secondary)
+
+                    Text(watchURL.absoluteString)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    HStack(spacing: 10) {
+                        Button {
+                            let pasteboard = NSPasteboard.general
+                            pasteboard.clearContents()
+                            pasteboard.setString(watchURL.absoluteString, forType: .string)
+                        } label: {
+                            Label("复制链接", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(mint)
+
+                        Button {
+                            NSWorkspace.shared.open(watchURL)
+                        } label: {
+                            Label("打开学员页", systemImage: "safari")
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+            } else {
+                unavailableState
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(24)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.96, green: 0.99, blue: 1.00),
+                    Color(red: 0.97, green: 0.96, blue: 1.00)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+    }
+
+    private var unavailableState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "qrcode")
+                .font(.system(size: 42, weight: .semibold))
+                .foregroundStyle(blue.opacity(0.82))
+            Text("暂时没有可分享的学员链接")
+                .font(.headline)
+            Text("先在课堂与分享区域选择一个课堂，再生成二维码。")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, minHeight: 310)
+    }
+
+    private static func makeQRCode(for value: String) -> NSImage? {
+        guard let filter = CIFilter(name: "CIQRCodeGenerator"),
+              let data = value.data(using: .utf8) else {
+            return nil
+        }
+
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 9, y: 9)) else {
+            return nil
+        }
+
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        guard let cgImage = context.createCGImage(output, from: output.extent) else {
+            return nil
+        }
+        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 }
 
