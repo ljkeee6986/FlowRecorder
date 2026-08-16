@@ -129,11 +129,128 @@ private enum ClassroomClientError: LocalizedError {
     }
 }
 
+@MainActor
+final class EmbeddedClassroomService {
+    private var process: Process?
+    private var logHandle: FileHandle?
+
+    func startIfAvailable() {
+        guard process == nil,
+              let resources = Bundle.main.resourceURL else { return }
+
+        let classroomResources = resources.appendingPathComponent("Classroom", isDirectory: true)
+        let nodeURL = classroomResources.appendingPathComponent("node")
+        let serverURL = classroomResources.appendingPathComponent("server.mjs")
+        let webURL = classroomResources.appendingPathComponent("web", isDirectory: true)
+        guard FileManager.default.isExecutableFile(atPath: nodeURL.path),
+              FileManager.default.fileExists(atPath: serverURL.path),
+              FileManager.default.fileExists(atPath: webURL.appendingPathComponent("index.html").path) else {
+            return
+        }
+
+        var preparedLogHandle: FileHandle?
+        do {
+            let supportURL = try classroomSupportURL()
+            let jwtSecret = try loadOrCreateJWTSecret(in: supportURL)
+            let logURL = supportURL.appendingPathComponent("classroom-service.log")
+            rotateLogIfNeeded(logURL)
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            let logHandle = try FileHandle(forWritingTo: logURL)
+            preparedLogHandle = logHandle
+            try logHandle.seekToEnd()
+
+            let process = Process()
+            process.executableURL = nodeURL
+            process.arguments = [serverURL.path]
+            process.currentDirectoryURL = classroomResources
+            process.standardOutput = logHandle
+            process.standardError = logHandle
+            process.environment = ProcessInfo.processInfo.environment.merging([
+                "NODE_ENV": "development",
+                "PORT": "4100",
+                "WEB_ORIGIN": "http://localhost:4100",
+                "PUBLIC_WEB_URL": "auto",
+                "WEB_DIST_DIR": webURL.path,
+                "JWT_SECRET": jwtSecret,
+                "TEACHER_ACCESS_CODE": "jack-demo",
+                "ZERO_COST_MODE": "true",
+                "TRTC_ENABLED": "false",
+                "TRTC_SDK_APP_ID": "",
+                "TRTC_SECRET_KEY": "",
+                "TRTC_STRICT_PERMISSIONS": "false",
+                "PERSISTENCE_DRIVER": "file",
+                "PERSISTENCE_FILE": supportURL.appendingPathComponent("classroom-state.json").path,
+                "PAYMENTS_ENABLED": "false",
+                "DESKTOP_PARENT_PID": "\(ProcessInfo.processInfo.processIdentifier)"
+            ]) { _, embeddedValue in embeddedValue }
+
+            try process.run()
+            self.process = process
+            self.logHandle = logHandle
+            preparedLogHandle = nil
+        } catch {
+            try? preparedLogHandle?.close()
+            try? logHandle?.close()
+            logHandle = nil
+            process = nil
+            appendStatusLogLine("[\(Date())] embedded classroom failed: \(error.localizedDescription)\n", to: fallbackLogURL())
+        }
+    }
+
+    func stop() {
+        if let process, process.isRunning {
+            process.terminate()
+        }
+        process = nil
+        try? logHandle?.close()
+        logHandle = nil
+    }
+
+    private func classroomSupportURL() throws -> URL {
+        let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let directory = applicationSupport
+            .appendingPathComponent("FlowRecorder", isDirectory: true)
+            .appendingPathComponent("Classroom", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+
+    private func loadOrCreateJWTSecret(in directory: URL) throws -> String {
+        let secretURL = directory.appendingPathComponent("jwt-secret")
+        if let existing = try? String(contentsOf: secretURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           existing.count >= 32 {
+            return existing
+        }
+
+        let secret = (0..<4).map { _ in UUID().uuidString.replacingOccurrences(of: "-", with: "") }.joined()
+        try secret.write(to: secretURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: secretURL.path)
+        return secret
+    }
+
+    private func rotateLogIfNeeded(_ url: URL) {
+        guard let size = (try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize,
+              size > 2 * 1_024 * 1_024 else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func fallbackLogURL() -> URL {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first!
+        let directory = movies.appendingPathComponent("FlowRecorder", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory.appendingPathComponent("status.txt")
+    }
+}
+
 @main
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private static var strongDelegate: AppDelegate?
     private let model = AppModel()
+    private let embeddedClassroomService = EmbeddedClassroomService()
     private var mainWindow: NSWindow?
 
     static func main() {
@@ -146,8 +263,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        embeddedClassroomService.startIfAvailable()
         configureMenu()
         showMainWindow()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        embeddedClassroomService.stop()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -466,7 +588,7 @@ final class AppModel: ObservableObject {
         defer { isClassroomBusy = false }
 
         do {
-            try await connectClassroom()
+            try await connectClassroomWithRetry()
         } catch {
             classroomToken = nil
             classroomRooms = []
@@ -623,6 +745,22 @@ final class AppModel: ObservableObject {
         } else {
             classroomConnectionStatus = "课堂已连接；零成本保护未开启，请检查配置"
         }
+    }
+
+    private func connectClassroomWithRetry() async throws {
+        var lastError: Error?
+        for attempt in 0..<5 {
+            do {
+                try await connectClassroom()
+                return
+            } catch {
+                lastError = error
+                if attempt < 4 {
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
+        }
+        throw lastError ?? ClassroomClientError.invalidResponse
     }
 
     private func replaceClassroom(_ room: ClassroomRoom) {

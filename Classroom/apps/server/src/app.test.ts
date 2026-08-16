@@ -1,4 +1,7 @@
 import request from "supertest";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createClassroomServer } from "./app.js";
 import { ClassroomStore } from "./store.js";
@@ -20,6 +23,24 @@ describe("classroom API", () => {
     expect(response.body.mediaProvider).toBe("mock");
     expect(response.body.publicWebUrl).toMatch(/^http/);
     server.io.close();
+  });
+
+  it("serves the built classroom app and keeps API routes available", async () => {
+    const webDistDir = await mkdtemp(join(tmpdir(), "flowrecorder-classroom-web-"));
+    await mkdir(join(webDistDir, "assets"));
+    await writeFile(join(webDistDir, "index.html"), "<html><body>embedded-classroom</body></html>");
+    await writeFile(join(webDistDir, "assets", "app.js"), "console.log('embedded')");
+    const server = createClassroomServer(new ClassroomStore(false), "memory", webDistDir);
+
+    try {
+      const page = await request(server.app).get("/teacher").expect(200);
+      expect(page.text).toContain("embedded-classroom");
+      await request(server.app).get("/assets/app.js").expect(200);
+      await request(server.app).get("/api/health").expect(200);
+    } finally {
+      server.io.close();
+      await rm(webDistDir, { recursive: true, force: true });
+    }
   });
 
   it("creates a room and joins through its private share code", async () => {

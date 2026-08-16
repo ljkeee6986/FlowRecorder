@@ -29,6 +29,8 @@
 - 默认使用 `mock` 音视频提供方；配置 TRTC 后，网页观看、讲师网页推流和学员连麦会自动切换到真实音视频。
 - 腾讯云免费时长包用完后会自动转后付费，因此零成本开发期间保持 `ZERO_COST_MODE=true`，不领取或启用真实 TRTC 用量。
 - Mac `0.3.0` 开发构建已能连接本地课堂服务，并在开课/结束时调用现有安全录制入口；ScreenCaptureKit 与 MP4 封装核心保持独立。
+- Mac App 构建时会把课堂网页、单文件服务端和 Node 运行时打入 `Contents/Resources/Classroom`；App 启动和退出时负责管理服务生命周期。
+- 内置服务的数据保存在 `~/Library/Application Support/FlowRecorder/Classroom`，JWT 密钥和课堂状态文件权限为 `600`。
 - Windows 原生讲师端尚未开始。
 
 ## 本地启动
@@ -46,6 +48,8 @@ npm run dev
 - 学员链接：进入控制台后点击“复制链接”。
 
 同一 Wi-Fi 下可以在手机访问终端显示的 `Network` 地址。讲师控制台会按当前访问地址生成可复制的学员链接。
+
+打包后的 Mac App 不需要运行上述命令。它会在 `4100` 端口自动提供 API、WebSocket、讲师页和学员页，并自动识别当前 Wi-Fi 地址。
 
 ## 验证
 

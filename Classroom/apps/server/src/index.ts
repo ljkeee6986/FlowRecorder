@@ -11,8 +11,11 @@ store.setMutationListener(() => persistence.scheduleSave(store.exportState()));
 persistence.scheduleSave(store.exportState());
 
 const { httpServer, io } = createClassroomServer(store, persistence.name);
+let isShuttingDown = false;
 
 async function shutdown(signal: string): Promise<void> {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   try {
     console.log(`${signal}: saving classroom state...`);
     await persistence.close();
@@ -28,6 +31,18 @@ async function shutdown(signal: string): Promise<void> {
 
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 process.once("SIGINT", () => void shutdown("SIGINT"));
+
+const desktopParentPid = Number(process.env.DESKTOP_PARENT_PID ?? 0);
+if (Number.isInteger(desktopParentPid) && desktopParentPid > 1) {
+  const parentMonitor = setInterval(() => {
+    try {
+      process.kill(desktopParentPid, 0);
+    } catch {
+      void shutdown("PARENT_EXIT");
+    }
+  }, 2_000);
+  parentMonitor.unref();
+}
 
 httpServer.listen(config.port, "0.0.0.0", () => {
   const room = store.listRooms()[0];

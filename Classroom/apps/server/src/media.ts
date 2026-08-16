@@ -13,7 +13,6 @@ interface TlsSigConstructor {
   new (sdkAppId: number, secretKey: string): TlsSigApi;
 }
 
-const { Api: TlsSigApi } = require("tls-sig-api-v2") as { Api: TlsSigConstructor };
 const mediaGrantLifetimeSeconds = 6 * 60 * 60;
 
 export type MediaRole = "viewer" | "cohost" | "teacher";
@@ -47,6 +46,7 @@ export class TencentTrtcProvider implements MediaProvider {
   private readonly sdkAppId: number;
 
   constructor(sdkAppId = config.trtc.sdkAppId, secretKey = config.trtc.secretKey) {
+    const { Api: TlsSigApi } = require("tls-sig-api-v2") as { Api: TlsSigConstructor };
     this.sdkAppId = sdkAppId;
     this.signer = new TlsSigApi(sdkAppId, secretKey);
   }

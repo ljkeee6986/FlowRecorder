@@ -1,6 +1,7 @@
 import { config as loadEnv } from "dotenv";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { networkInterfaces } from "node:os";
 
 const workspaceEnvFile = fileURLToPath(new URL("../../../.env", import.meta.url));
 const workspaceRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -11,17 +12,33 @@ export function resolveWorkspacePath(filePath: string): string {
 }
 
 const isProduction = process.env.NODE_ENV === "production";
+const port = Number(process.env.PORT ?? 4100);
 const defaultJwtSecret = "flowrecorder-classroom-local-development-only";
 const defaultTeacherAccessCode = "jack-demo";
 const persistenceDriver = process.env.PERSISTENCE_DRIVER ?? (isProduction ? "postgres" : "file");
 const persistenceFile = resolveWorkspacePath(process.env.PERSISTENCE_FILE ?? ".data/classroom-state.json");
 const zeroCostMode = process.env.ZERO_COST_MODE !== "false";
+const webDistDir = process.env.WEB_DIST_DIR?.trim()
+  ? resolveWorkspacePath(process.env.WEB_DIST_DIR.trim())
+  : "";
+
+function automaticPublicWebUrl(): string {
+  const addresses = Object.values(networkInterfaces())
+    .flatMap((entries) => entries ?? [])
+    .filter((entry) => entry.family === "IPv4" && !entry.internal)
+    .map((entry) => entry.address);
+  const privateAddress = addresses.find((address) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address));
+  return `http://${privateAddress ?? addresses[0] ?? "localhost"}:${port}`;
+}
+
+const configuredPublicWebUrl = process.env.PUBLIC_WEB_URL ?? "http://localhost:4173";
 
 export const config = {
   isProduction,
-  port: Number(process.env.PORT ?? 4100),
+  port,
   webOrigin: process.env.WEB_ORIGIN ?? "http://localhost:4173",
-  publicWebUrl: process.env.PUBLIC_WEB_URL ?? "http://localhost:4173",
+  publicWebUrl: configuredPublicWebUrl === "auto" ? automaticPublicWebUrl() : configuredPublicWebUrl,
+  webDistDir,
   zeroCostMode,
   jwtSecret: process.env.JWT_SECRET ?? defaultJwtSecret,
   teacherAccessCode: process.env.TEACHER_ACCESS_CODE ?? defaultTeacherAccessCode,

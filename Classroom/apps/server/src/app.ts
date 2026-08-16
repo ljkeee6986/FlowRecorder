@@ -1,4 +1,5 @@
 import { createServer, type Server as HttpServer } from "node:http";
+import { join } from "node:path";
 import cors from "cors";
 import express, { type Express, type Request, type Response } from "express";
 import { rateLimit } from "express-rate-limit";
@@ -49,7 +50,11 @@ export interface ClassroomServer {
   store: ClassroomStore;
 }
 
-export function createClassroomServer(store = new ClassroomStore(), persistenceName: "memory" | "file" | "postgres" = "memory"): ClassroomServer {
+export function createClassroomServer(
+  store = new ClassroomStore(),
+  persistenceName: "memory" | "file" | "postgres" = "memory",
+  webDistDir = config.webDistDir
+): ClassroomServer {
   const app = express();
   const httpServer = createServer(app);
   const io = createSocketServer(httpServer, store);
@@ -57,6 +62,7 @@ export function createClassroomServer(store = new ClassroomStore(), persistenceN
   if (config.isProduction) app.set("trust proxy", 1);
   app.use(cors({ origin: config.isProduction ? config.webOrigin : true, credentials: true }));
   app.use(express.json({ limit: "1mb" }));
+  if (webDistDir) app.use(express.static(webDistDir));
 
   app.get("/api/health", (_req, res) => {
     res.json({
@@ -196,6 +202,16 @@ export function createClassroomServer(store = new ClassroomStore(), persistenceN
       messages: store.messagesForRoom(room.id)
     });
   });
+
+  if (webDistDir) {
+    app.use((req, res, next) => {
+      if (req.method !== "GET" || req.path.startsWith("/api/") || req.path.startsWith("/socket.io/")) {
+        next();
+        return;
+      }
+      res.sendFile(join(webDistDir, "index.html"));
+    });
+  }
 
   app.use((error: unknown, _req: Request, res: Response, _next: (error?: unknown) => void) => {
     console.error(error);

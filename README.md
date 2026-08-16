@@ -32,6 +32,7 @@
 - 支持复制诊断，包含版本、macOS、App 路径、最近录屏、临时文件和日志尾部。
 - 支持在“本地录制”和“在线课堂”之间切换。
 - 支持连接本机课堂服务、选择课堂、复制学员链接以及开始/结束课堂。
+- Mac App 已内置零成本课堂服务、网页和 Node 运行时；发到另一台 Mac 后不需要安装 Node，也不需要执行 `npm run dev`。
 - 在线课堂可同步调用现有安全录制链路保存本地 MP4；课堂接口失败时不会破坏录屏文件。
 - 零成本模式下课堂服务强制使用模拟媒体，并拒绝 TRTC 和支付配置，避免意外产生云费用。
 
@@ -86,7 +87,7 @@ tail -40 "$HOME/Movies/FlowRecorder/status.txt"
 
 - 当前只支持 macOS 15+。
 - 当前只打包本地测试版 `.app`，尚未做 DMG / notarization。
-- 在线课堂当前为同一 Wi-Fi 的本地演练模式，真实公网音视频尚未启用。
+- 在线课堂当前为同一 Wi-Fi 的本地演练模式，App 会自动启动本地课堂服务；真实公网音视频尚未启用。
 - 摄像头小窗目前依赖屏幕可见内容被捕获；不是独立合成轨道。
 - 区域/窗口录制通过稳定全屏捕获后裁剪完成；录制中移动窗口可能导致裁剪区域不符合预期。
 - UI 自动化对 SwiftUI 坐标点击不稳定，9:16 / 1:1 / 鼠标点击高亮仍建议人工回归确认。
@@ -99,6 +100,8 @@ cd /Users/kun/Documents/Codex/FlowRecorder
 ditto build/FlowRecorder.app "/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app"
 codesign --verify --deep --strict "/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app"
 ```
+
+构建机需要 Node.js 和已经安装好的 `Classroom/node_modules`。构建脚本会编译课堂服务和网页，并把 Node 运行时一并放入 App；成品约 `125 MB`，使用者不需要额外安装开发环境。
 
 ## 下一步
 
