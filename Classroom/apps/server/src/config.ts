@@ -13,6 +13,7 @@ export function resolveWorkspacePath(filePath: string): string {
 
 const isProduction = process.env.NODE_ENV === "production";
 const port = Number(process.env.PORT ?? 4100);
+const publicWebPort = Number(process.env.PUBLIC_WEB_PORT ?? port);
 const defaultJwtSecret = "flowrecorder-classroom-local-development-only";
 const defaultTeacherAccessCode = "jack-demo";
 const persistenceDriver = process.env.PERSISTENCE_DRIVER ?? (isProduction ? "postgres" : "file");
@@ -22,13 +23,34 @@ const webDistDir = process.env.WEB_DIST_DIR?.trim()
   ? resolveWorkspacePath(process.env.WEB_DIST_DIR.trim())
   : "";
 
-function automaticPublicWebUrl(): string {
-  const addresses = Object.values(networkInterfaces())
-    .flatMap((entries) => entries ?? [])
-    .filter((entry) => entry.family === "IPv4" && !entry.internal)
-    .map((entry) => entry.address);
+interface NetworkAddressCandidate {
+  name: string;
+  address: string;
+  family: string;
+  internal: boolean;
+}
+
+export function resolveAutomaticPublicWebUrl(candidates: NetworkAddressCandidate[], selectedPort: number): string {
+  const addresses = candidates
+    .filter((candidate) => candidate.family === "IPv4" && !candidate.internal)
+    .sort((left, right) => {
+      const priority = (name: string) => name === "en0" ? 0 : name.startsWith("en") ? 1 : 2;
+      return priority(left.name) - priority(right.name);
+    })
+    .map((candidate) => candidate.address);
   const privateAddress = addresses.find((address) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address));
-  return `http://${privateAddress ?? addresses[0] ?? "localhost"}:${port}`;
+  return `http://${privateAddress ?? addresses[0] ?? "localhost"}:${selectedPort}`;
+}
+
+function automaticPublicWebUrl(): string {
+  const candidates = Object.entries(networkInterfaces())
+    .flatMap(([name, entries]) => (entries ?? []).map((entry) => ({
+      name,
+      address: entry.address,
+      family: entry.family,
+      internal: entry.internal
+    })));
+  return resolveAutomaticPublicWebUrl(candidates, publicWebPort);
 }
 
 const configuredPublicWebUrl = process.env.PUBLIC_WEB_URL ?? "http://localhost:4173";
@@ -37,7 +59,9 @@ export const config = {
   isProduction,
   port,
   webOrigin: process.env.WEB_ORIGIN ?? "http://localhost:4173",
-  publicWebUrl: configuredPublicWebUrl === "auto" ? automaticPublicWebUrl() : configuredPublicWebUrl,
+  get publicWebUrl() {
+    return configuredPublicWebUrl === "auto" ? automaticPublicWebUrl() : configuredPublicWebUrl;
+  },
   webDistDir,
   zeroCostMode,
   jwtSecret: process.env.JWT_SECRET ?? defaultJwtSecret,

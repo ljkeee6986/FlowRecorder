@@ -82,6 +82,20 @@ struct ClassroomRoom: Decodable, Identifiable, Hashable {
     let status: String
 }
 
+struct ClassroomConnectivityItem: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let detail: String
+    let passed: Bool
+}
+
+private struct ClassroomHTTPProbe {
+    let statusCode: Int?
+    let mimeType: String?
+    let data: Data
+    let errorDescription: String?
+}
+
 private struct ClassroomHealthResponse: Decodable {
     let ok: Bool
     let mediaProvider: String
@@ -172,6 +186,7 @@ final class EmbeddedClassroomService {
                 "PORT": "4100",
                 "WEB_ORIGIN": "http://localhost:4100",
                 "PUBLIC_WEB_URL": "auto",
+                "PUBLIC_WEB_PORT": "4100",
                 "WEB_DIST_DIR": webURL.path,
                 "JWT_SECRET": jwtSecret,
                 "TEACHER_ACCESS_CODE": "jack-demo",
@@ -430,6 +445,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var isClassroomBusy = false
     @Published private(set) var isClassroomSelfTesting = false
     @Published private(set) var classroomSelfTestResultURL: URL?
+    @Published private(set) var isClassroomConnectivityChecking = false
+    @Published private(set) var classroomConnectivityItems: [ClassroomConnectivityItem] = []
+    @Published private(set) var classroomConnectivitySummary = "尚未检查手机连接"
     @Published var includeSystemAudio = true {
         didSet { persist(includeSystemAudio, forKey: DefaultsKey.includeSystemAudio) }
     }
@@ -823,6 +841,117 @@ final class AppModel: ObservableObject {
         classroomConnectionStatus = "学员链接已复制"
     }
 
+    func runClassroomConnectivityCheck() async {
+        guard !isClassroomBusy, !isClassroomSelfTesting, !isClassroomConnectivityChecking else { return }
+        isClassroomBusy = true
+        isClassroomConnectivityChecking = true
+        classroomConnectivityItems = []
+        classroomConnectivitySummary = "正在检查手机连接..."
+        defer {
+            isClassroomBusy = false
+            isClassroomConnectivityChecking = false
+        }
+
+        do {
+            try await connectClassroomWithRetry()
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "service",
+                    title: "本地课堂服务",
+                    detail: "课堂服务已启动并能正常读取课堂数据",
+                    passed: true
+                )
+            )
+
+            let costGuardPassed = classroomZeroCostMode && classroomMediaProvider == "mock"
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "cost-guard",
+                    title: "零成本保护",
+                    detail: costGuardPassed
+                        ? "模拟媒体已启用，腾讯云和支付功能保持关闭"
+                        : "当前不是零成本模拟模式，请停止测试并检查配置",
+                    passed: costGuardPassed
+                )
+            )
+
+            guard let room = selectedClassroom,
+                  let webURL = classroomWebURL,
+                  let watchURL = selectedClassroomWatchURL else {
+                classroomConnectivityItems.append(
+                    ClassroomConnectivityItem(
+                        id: "room",
+                        title: "课堂与学员链接",
+                        detail: "还没有可测试的课堂，请先点击加号新建课堂",
+                        passed: false
+                    )
+                )
+                finishClassroomConnectivityCheck()
+                return
+            }
+
+            let host = watchURL.host ?? ""
+            let lanAddressPassed = Self.isPrivateLANHost(host)
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "lan-address",
+                    title: "手机局域网地址",
+                    detail: lanAddressPassed
+                        ? "学员链接使用局域网地址 \(host)，不是仅限本机的 localhost"
+                        : "当前地址是 \(host.isEmpty ? "未知地址" : host)，同一 Wi-Fi 的手机可能无法访问",
+                    passed: lanAddressPassed
+                )
+            )
+
+            let publicRoomURL = webURL
+                .appendingPathComponent("api/live", isDirectory: true)
+                .appendingPathComponent(room.shareCode)
+            async let pageRequest = classroomHTTPProbe(watchURL)
+            async let roomRequest = classroomHTTPProbe(publicRoomURL)
+            let (pageResult, roomResult) = await (pageRequest, roomRequest)
+
+            let pagePassed = pageResult.statusCode == 200
+                && pageResult.mimeType == "text/html"
+                && !pageResult.data.isEmpty
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "learner-page",
+                    title: "学员网页",
+                    detail: pagePassed
+                        ? "学员页面已通过局域网地址正常返回"
+                        : pageResult.errorDescription
+                            ?? "学员页面返回异常（HTTP \(pageResult.statusCode ?? 0)）",
+                    passed: pagePassed
+                )
+            )
+
+            let roomPassed = roomResult.statusCode == 200 && !roomResult.data.isEmpty
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "room-api",
+                    title: "课堂进入接口",
+                    detail: roomPassed
+                        ? "课堂信息可以通过手机使用的地址读取"
+                        : roomResult.errorDescription
+                            ?? "课堂接口返回异常（HTTP \(roomResult.statusCode ?? 0)）",
+                    passed: roomPassed
+                )
+            )
+
+            finishClassroomConnectivityCheck()
+        } catch {
+            classroomConnectivityItems.append(
+                ClassroomConnectivityItem(
+                    id: "request-error",
+                    title: "连接检查中断",
+                    detail: humanReadable(error),
+                    passed: false
+                )
+            )
+            finishClassroomConnectivityCheck()
+        }
+    }
+
     func revealClassroomSelfTestRecording() {
         guard let classroomSelfTestResultURL else { return }
         NSWorkspace.shared.activateFileViewerSelecting([classroomSelfTestResultURL])
@@ -875,6 +1004,56 @@ final class AppModel: ObservableObject {
             }
         }
         throw lastError ?? ClassroomClientError.invalidResponse
+    }
+
+    private func finishClassroomConnectivityCheck() {
+        let failures = classroomConnectivityItems.filter { !$0.passed }
+        if failures.isEmpty, !classroomConnectivityItems.isEmpty {
+            classroomConnectivitySummary = "Mac 端检查通过，请让手机连接同一 Wi-Fi 后扫码进入"
+            classroomConnectionStatus = "手机连接自检通过，可以打开二维码测试"
+        } else {
+            classroomConnectivitySummary = "发现 \(failures.count) 项问题，请按下面提示处理"
+            classroomConnectionStatus = "手机连接自检发现问题：\(failures.first?.title ?? "请检查课堂服务")"
+        }
+    }
+
+    private func classroomHTTPProbe(_ url: URL) async -> ClassroomHTTPProbe {
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 6
+            request.cachePolicy = .reloadIgnoringLocalCacheData
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw ClassroomClientError.invalidResponse
+            }
+            return ClassroomHTTPProbe(
+                statusCode: httpResponse.statusCode,
+                mimeType: httpResponse.mimeType,
+                data: data,
+                errorDescription: nil
+            )
+        } catch {
+            return ClassroomHTTPProbe(
+                statusCode: nil,
+                mimeType: nil,
+                data: Data(),
+                errorDescription: humanReadable(error)
+            )
+        }
+    }
+
+    private static func isPrivateLANHost(_ host: String) -> Bool {
+        if host.hasPrefix("10.") || host.hasPrefix("192.168.") {
+            return true
+        }
+        let components = host.split(separator: ".")
+        if components.count == 4,
+           components[0] == "172",
+           let second = Int(components[1]),
+           (16...31).contains(second) {
+            return true
+        }
+        return false
     }
 
     private func replaceClassroom(_ room: ClassroomRoom) {
@@ -1918,6 +2097,7 @@ struct MainView: View {
     @State private var windowSearchText = ""
     @State private var classroomQRCodeShown = false
     @State private var classroomCreatorShown = false
+    @State private var classroomConnectivityShown = false
 
     private let panelRadius: CGFloat = 18
     private let freshBlue = Color(red: 0.08, green: 0.40, blue: 0.76)
@@ -1995,6 +2175,13 @@ struct MainView: View {
                 isPresented: $classroomCreatorShown
             )
             .frame(width: 460, height: 255)
+        }
+        .sheet(isPresented: $classroomConnectivityShown) {
+            ClassroomConnectivitySheet(
+                model: model,
+                isPresented: $classroomConnectivityShown
+            )
+            .frame(width: 540, height: 500)
         }
     }
 
@@ -2241,8 +2428,9 @@ struct MainView: View {
         freshPanel {
             let needsAttention = model.classroomConnectionStatus.contains("失败")
                 || model.classroomConnectionStatus.contains("停止")
+                || model.classroomConnectionStatus.contains("问题")
             HStack(spacing: 12) {
-                if model.isClassroomSelfTesting {
+                if model.isClassroomSelfTesting || model.isClassroomConnectivityChecking {
                     ProgressView()
                         .controlSize(.small)
                 } else {
@@ -2266,6 +2454,19 @@ struct MainView: View {
                     }
                     .buttonStyle(.bordered)
                 }
+                Button {
+                    classroomConnectivityShown = true
+                    Task { await model.runClassroomConnectivityCheck() }
+                } label: {
+                    Label(model.isClassroomConnectivityChecking ? "检查中" : "手机自检", systemImage: "wifi")
+                }
+                .buttonStyle(.bordered)
+                .disabled(
+                    model.isClassroomConnectivityChecking
+                    || model.isClassroomSelfTesting
+                    || model.isClassroomBusy
+                    || model.selectedClassroom == nil
+                )
                 Button {
                     Task { await model.runClassroomRecordingSelfTest() }
                 } label: {
@@ -2859,6 +3060,125 @@ struct MainView: View {
         if teleprompterShown {
             OverlayManager.shared.updateTeleprompter(text: model.teleprompterText, fontSize: model.teleprompterFontSize, scrollSpeed: model.teleprompterScrollSpeed)
         }
+    }
+}
+
+struct ClassroomConnectivitySheet: View {
+    @ObservedObject var model: AppModel
+    @Binding var isPresented: Bool
+
+    private let ink = Color(red: 0.10, green: 0.12, blue: 0.16)
+    private let mint = Color(red: 0.06, green: 0.56, blue: 0.48)
+    private let blue = Color(red: 0.08, green: 0.40, blue: 0.76)
+
+    private var allPassed: Bool {
+        !model.classroomConnectivityItems.isEmpty
+            && model.classroomConnectivityItems.allSatisfy(\.passed)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("手机连接自检")
+                        .font(.system(size: 23, weight: .bold, design: .rounded))
+                        .foregroundStyle(ink)
+                    Text("检查同一 Wi-Fi 下的手机能否打开课堂")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    isPresented = false
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(.secondary.opacity(0.75))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭手机连接自检")
+            }
+
+            HStack(spacing: 11) {
+                if model.isClassroomConnectivityChecking {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: allPassed ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(allPassed ? mint : Color.orange)
+                }
+                Text(model.classroomConnectivitySummary)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(ink.opacity(0.80))
+                Spacer()
+            }
+            .padding(13)
+            .background((allPassed ? mint : Color.orange).opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            if model.classroomConnectivityItems.isEmpty {
+                VStack(spacing: 10) {
+                    ProgressView()
+                    Text("正在检查课堂服务和局域网地址")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    VStack(spacing: 9) {
+                        ForEach(model.classroomConnectivityItems) { item in
+                            HStack(alignment: .top, spacing: 12) {
+                                Image(systemName: item.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(item.passed ? mint : Color.red)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(item.title)
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(ink)
+                                    Text(item.detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(12)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.white.opacity(0.72), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(Color.black.opacity(0.07), lineWidth: 1))
+                        }
+                    }
+                }
+            }
+
+            HStack(spacing: 10) {
+                Text("此检查不会连接腾讯云或产生费用")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    Task { await model.runClassroomConnectivityCheck() }
+                } label: {
+                    Label("重新检查", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(blue)
+                .disabled(model.isClassroomConnectivityChecking || model.isClassroomBusy)
+            }
+        }
+        .padding(24)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.96, green: 0.99, blue: 1.00),
+                    Color(red: 0.97, green: 0.96, blue: 1.00)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
     }
 }
 
