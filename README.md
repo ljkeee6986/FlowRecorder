@@ -4,13 +4,17 @@
 
 在线教学平台的第一阶段代码位于 [`Classroom/`](Classroom/README.md)，包含讲师控制台、微信 H5 观看页、课堂实时互动、权限控制以及云音视频和支付接口边界。现有 macOS 录屏核心保持独立。
 
+![FlowRecorder 功能演示界面](docs/flowrecorder-demo-poster.jpg)
+
+- [观看 56 秒功能演示](docs/flowrecorder-demo.mp4)
+- [下载当前稳定测试版](https://github.com/ljkeee6986/FlowRecorder/releases/tag/v0.2.0-test)
+
 ## 当前版本
 
 - 当前开发构建：`测试版 v0.3.0 (26)`，加入本地录制/在线课堂工作模式、零成本课堂联动、一键联动自检、本地课堂二维码、Mac 端新建课堂和手机连接自检。
 - 当前稳定发布：`v0.2.0-test`，App 显示版本为 `测试版 v0.2.0 (20)`。
 - GitHub Release：`https://github.com/ljkeee6986/FlowRecorder/releases/tag/v0.2.0-test`
 - 下载附件：`Jack-v0.2.0-macOS-arm64.dmg` / `Jack-v0.2.0-macOS-arm64.zip`
-- 测试包位置：`/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app`
 - 默认输出目录：`~/Movies/FlowRecorder`
 - 诊断日志：`~/Movies/FlowRecorder/status.txt`
 - 隔离目录：`~/Movies/FlowRecorder/损坏录屏`
@@ -90,7 +94,7 @@ tail -40 "$HOME/Movies/FlowRecorder/status.txt"
 ## 已知限制
 
 - 当前只支持 macOS 15+。
-- 当前只打包本地测试版 `.app`，尚未做 DMG / notarization。
+- 当前稳定测试版已提供 DMG 和 ZIP，但尚未完成 Apple notarization，首次运行仍需要手动确认系统安全提示。
 - 在线课堂当前为同一 Wi-Fi 的本地演练模式，App 会自动启动本地课堂服务；真实公网音视频尚未启用。
 - 摄像头小窗目前依赖屏幕可见内容被捕获；不是独立合成轨道。
 - 区域/窗口录制通过稳定全屏捕获后裁剪完成；录制中移动窗口可能导致裁剪区域不符合预期。
@@ -99,10 +103,10 @@ tail -40 "$HOME/Movies/FlowRecorder/status.txt"
 ## 构建
 
 ```bash
-cd /Users/kun/Documents/Codex/FlowRecorder
+git clone https://github.com/ljkeee6986/FlowRecorder.git
+cd FlowRecorder
 ./build.sh
-ditto build/FlowRecorder.app "/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app"
-codesign --verify --deep --strict "/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app"
+codesign --verify --deep --strict build/FlowRecorder.app
 ```
 
 构建机需要 Node.js 和已经安装好的 `Classroom/node_modules`。构建脚本会编译课堂服务和网页，并把 Node 运行时一并放入 App；成品约 `125 MB`，使用者不需要额外安装开发环境。

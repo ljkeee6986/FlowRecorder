@@ -36,7 +36,7 @@
 ## 本地启动
 
 ```bash
-cd /Users/kun/Documents/Codex/FlowRecorder/Classroom
+cd FlowRecorder/Classroom
 npm install
 npm run dev
 ```

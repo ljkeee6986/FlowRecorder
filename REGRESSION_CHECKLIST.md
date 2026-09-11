@@ -4,7 +4,7 @@
 
 ## 环境信息
 
-- App：`/Users/kun/Desktop/FlowRecorder测试版/录屏大师Jack.app`
+- App：`build/FlowRecorder.app`
 - 输出目录：`~/Movies/FlowRecorder`
 - 临时目录：`~/Movies/FlowRecorder/.in-progress`
 - 日志：`~/Movies/FlowRecorder/status.txt`
